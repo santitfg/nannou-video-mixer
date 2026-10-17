@@ -1,0 +1,296 @@
+//! Reading shader files from the shaders folder: the Unity-style
+//! `Properties { ... }` header plus the Shadertoy-style GLSL body.
+//!
+//! ```glsl
+//! Properties {
+//!     _Speed ("Speed", Range(0, 10)) = 1.0
+//!     _Scale ("Scale", Float) = 2.0
+//!     _Steps ("Steps", Int) = 4
+//! }
+//!
+//! void mainImage(out vec4 fragColor, in vec2 fragCoord) { ... }
+//! ```
+//!
+//! Every property becomes a global uniform of the same name in the shader
+//! and a Number input port on the module.
+
+use std::path::{Path, PathBuf};
+
+pub const SHADER_DIR: &str = "shaders";
+pub const MAX_CHANNELS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PropKind {
+    Float,
+    Range(f32, f32),
+    Int,
+}
+
+#[derive(Debug, Clone)]
+pub struct Property {
+    pub name: String,
+    pub label: String,
+    pub kind: PropKind,
+    pub default: f32,
+}
+
+impl Property {
+    pub fn clamp(&self, v: f32) -> f32 {
+        match self.kind {
+            PropKind::Float => v,
+            PropKind::Range(lo, hi) => v.clamp(lo.min(hi), lo.max(hi)),
+            PropKind::Int => v.round(),
+        }
+    }
+
+    pub fn glsl_type(&self) -> &'static str {
+        match self.kind {
+            PropKind::Int => "int",
+            _ => "float",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedShader {
+    pub props: Vec<Property>,
+    /// Highest `iChannelN` the code mentions, plus one (0 = none used).
+    pub channels: usize,
+    /// The source with the Properties block blanked out (newlines kept so
+    /// line numbers stay meaningful).
+    pub body: String,
+}
+
+/// File names (not paths) of every `.glsl`/`.frag` in the shaders folder, sorted.
+pub fn scan_library() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(SHADER_DIR)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+            if ext == "glsl" || ext == "frag" {
+                Some(path.file_name()?.to_str()?.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+pub fn shader_path(file: &str) -> PathBuf {
+    Path::new(SHADER_DIR).join(file)
+}
+
+pub fn parse_shader(source: &str) -> Result<ParsedShader, String> {
+    let (props, body) = extract_properties(source)?;
+    let channels = (0..MAX_CHANNELS)
+        .rev()
+        .find(|n| body.contains(&format!("iChannel{n}")))
+        .map(|n| n + 1)
+        .unwrap_or(0);
+    Ok(ParsedShader { props, channels, body })
+}
+
+fn extract_properties(source: &str) -> Result<(Vec<Property>, String), String> {
+    // The block starts at a line whose first word is `Properties`.
+    let mut offset = 0;
+    let mut start = None;
+    for line in source.split_inclusive('\n') {
+        if line.trim_start().starts_with("Properties") {
+            start = Some(offset + line.find("Properties").unwrap());
+            break;
+        }
+        offset += line.len();
+    }
+    let Some(start) = start else {
+        return Ok((Vec::new(), source.to_string()));
+    };
+
+    let after = start + "Properties".len();
+    let open = source[after..]
+        .find('{')
+        .map(|i| after + i)
+        .filter(|&i| source[after..i].trim().is_empty())
+        .ok_or("Properties: expected '{'")?;
+    let close = source[open..]
+        .find('}')
+        .map(|i| open + i)
+        .ok_or("Properties: missing closing '}'")?;
+
+    let mut props = Vec::new();
+    for (n, raw) in source[open + 1..close].lines().enumerate() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let prop = parse_property(line).map_err(|e| format!("Properties line {}: {e}", n + 1))?;
+        if props.iter().any(|p: &Property| p.name == prop.name) {
+            return Err(format!("Properties: '{}' declared twice", prop.name));
+        }
+        props.push(prop);
+    }
+
+    let mut body = String::with_capacity(source.len());
+    body.push_str(&source[..start]);
+    body.extend(source[start..=close].chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+    body.push_str(&source[close + 1..]);
+    Ok((props, body))
+}
+
+/// `_Name ("Label", Float|Int|Range(lo, hi)) = default`
+fn parse_property(line: &str) -> Result<Property, String> {
+    let paren = line.find('(').ok_or("expected '(' after the name")?;
+    let name = line[..paren].trim().to_string();
+    let valid = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(format!("'{name}' is not a valid identifier"));
+    }
+
+    // Find the ')' matching the first '(' (Range(...) nests one level).
+    let mut depth = 0;
+    let mut end = None;
+    for (i, c) in line[paren..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(paren + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.ok_or("unbalanced parentheses")?;
+    let inner = &line[paren + 1..end];
+
+    let q1 = inner.find('"').ok_or("expected a \"label\"")?;
+    let q2 = inner[q1 + 1..].find('"').ok_or("unterminated \"label\"")? + q1 + 1;
+    let label = inner[q1 + 1..q2].to_string();
+    let type_str = inner[q2 + 1..]
+        .trim_start()
+        .strip_prefix(',')
+        .ok_or("expected ',' then a type")?
+        .trim();
+
+    let lower = type_str.to_ascii_lowercase();
+    let kind = if lower == "float" {
+        PropKind::Float
+    } else if lower == "int" {
+        PropKind::Int
+    } else if let Some(args) = lower.strip_prefix("range") {
+        let args = args.trim().strip_prefix('(').and_then(|a| a.strip_suffix(')')).ok_or("Range needs (min, max)")?;
+        let (lo, hi) = args.split_once(',').ok_or("Range needs (min, max)")?;
+        let lo: f32 = lo.trim().parse().map_err(|_| "bad Range min")?;
+        let hi: f32 = hi.trim().parse().map_err(|_| "bad Range max")?;
+        PropKind::Range(lo, hi)
+    } else {
+        return Err(format!("unknown type '{type_str}' (use Float, Int or Range(min, max))"));
+    };
+
+    let rest = line[end + 1..].trim();
+    let default = match rest.strip_prefix('=') {
+        Some(v) => v
+            .trim()
+            .trim_end_matches([';', ','])
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("bad default '{}'", v.trim()))?,
+        None => 0.0,
+    };
+
+    let mut prop = Property { name, label, kind, default };
+    prop.default = prop.clamp(prop.default);
+    Ok(prop)
+}
+
+/// Bytes of the Globals uniform block, laid out to match `build_glsl`.
+pub const GLOBALS_SIZE: usize = 128;
+
+/// Wraps the user's code in the Shadertoy environment: uniforms, the
+/// `iChannelN` samplers, the property uniforms and a `main()` that calls
+/// `mainImage`. Returns the full source and how many lines the prelude
+/// adds (so error line numbers can be mapped back to the user's file).
+pub fn build_glsl(parsed: &ParsedShader) -> (String, usize) {
+    let mut s = String::new();
+    s.push_str("#version 450\n");
+    s.push_str(
+        "layout(std140, set = 0, binding = 0) uniform Globals {\n\
+         vec4 iResolution4;\n\
+         vec4 iMouse;\n\
+         vec4 iDate;\n\
+         vec4 iChannelRes4[4];\n\
+         float iTime;\n\
+         float iTimeDelta;\n\
+         int iFrame;\n\
+         float iFrameRate;\n\
+         };\n",
+    );
+    s.push_str("layout(std140, set = 0, binding = 1) uniform Props {\n vec4 _propsPad;\n");
+    for p in &parsed.props {
+        s.push_str(&format!(" {} {};\n", p.glsl_type(), p.name));
+    }
+    s.push_str("};\n");
+    s.push_str("layout(set = 0, binding = 2) uniform sampler iSamp;\n");
+    for n in 0..MAX_CHANNELS {
+        s.push_str(&format!(
+            "layout(set = 0, binding = {}) uniform texture2D iTex{n};\n#define iChannel{n} sampler2D(iTex{n}, iSamp)\n",
+            3 + n
+        ));
+    }
+    s.push_str("#define iResolution iResolution4.xyz\n#define iChannelResolution iChannelRes4\n");
+    // Textures are stored top row first but Shadertoy's v runs bottom-up,
+    // so flip v on every sampling call.
+    s.push_str(
+        "#define texture(s, uv) texture(s, vec2((uv).x, 1.0 - (uv).y))\n\
+         #define textureLod(s, uv, l) textureLod(s, vec2((uv).x, 1.0 - (uv).y), l)\n\
+         #define texelFetch(s, p, l) texelFetch(s, ivec2((p).x, textureSize(s, l).y - 1 - (p).y), l)\n",
+    );
+    s.push_str("layout(location = 0) out vec4 _fragOut;\n");
+    let prelude_lines = s.matches('\n').count();
+
+    s.push_str(&parsed.body);
+    s.push_str(
+        "\nvoid main() {\n\
+         vec4 c = vec4(0.0, 0.0, 0.0, 1.0);\n\
+         mainImage(c, vec2(gl_FragCoord.x, iResolution4.y - gl_FragCoord.y));\n\
+         _fragOut = vec4(c.rgb, 1.0);\n\
+         }\n",
+    );
+    (s, prelude_lines)
+}
+
+/// Byte size of the Props uniform block for `props`.
+pub fn props_size(props: &[Property]) -> usize {
+    (16 + 4 * props.len()).div_ceil(16) * 16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_properties() {
+        let src = "Properties {\n  _A (\"Speed\", Range(0, 10)) = 2.5\n  _B (\"Steps\", Int) = 3 // c\n  _C (\"Plain\", Float)\n}\nvoid mainImage(out vec4 f, in vec2 p){ f = texture(iChannel1, p); }";
+        let parsed = parse_shader(src).unwrap();
+        assert_eq!(parsed.props.len(), 3);
+        assert_eq!(parsed.props[0].kind, PropKind::Range(0.0, 10.0));
+        assert_eq!(parsed.props[0].default, 2.5);
+        assert_eq!(parsed.props[1].default, 3.0);
+        assert_eq!(parsed.channels, 2);
+        assert!(!parsed.body.contains("Properties"));
+        assert_eq!(parsed.body.matches('\n').count(), src.matches('\n').count());
+    }
+
+    #[test]
+    fn rejects_bad_type() {
+        assert!(parse_shader("Properties { _A (\"x\", Vector) = 1 }").is_err());
+    }
+}

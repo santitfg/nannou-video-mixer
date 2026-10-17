@@ -1,3 +1,4 @@
+use crate::modules::effects::shader::ShaderState;
 use crate::modules::math::{lfo::LfoState, mult::MultState, number::NumberState};
 use crate::modules::mix::blend::BlendState;
 use crate::modules::output::OutputState;
@@ -28,6 +29,9 @@ struct SavedModule {
     value: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     freq: Option<f32>,
+    /// A Shader's file name inside the shaders folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shader_file: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,16 +58,15 @@ fn build_save_file(model: &Model) -> SaveFile {
             let mut mix = None;
             let mut value = None;
             let mut freq = None;
+            let mut shader_file = None;
             match &m.body {
                 ModuleBody::Camera(cam) => {
-                    camera_name = cam
-                        .selected
-                        .and_then(|i| model.available_cameras.get(i))
-                        .map(|info| info.human_name().to_string());
+                    camera_name = cam.wanted.clone();
                 }
                 ModuleBody::Blend(blend) => mix = Some(blend.mix),
                 ModuleBody::Number(number) => value = Some(number.value),
                 ModuleBody::Lfo(lfo) => freq = Some(lfo.freq),
+                ModuleBody::Shader(shader) => shader_file = shader.file.clone(),
                 ModuleBody::Output(_) | ModuleBody::Mult(_) => {}
             };
             SavedModule {
@@ -76,6 +79,7 @@ fn build_save_file(model: &Model) -> SaveFile {
                 mix,
                 value,
                 freq,
+                shader_file,
             }
         })
         .collect();
@@ -122,6 +126,9 @@ pub fn load_composition(model: &mut Model, win: Rect, path: &std::path::Path) ->
                 let mut cam = CameraState::new();
                 cam.chrome = chrome;
                 if let Some(name) = &saved.camera_name {
+                    // Kept even if the device isn't plugged in right now:
+                    // it attaches when it shows up.
+                    cam.wanted = Some(name.clone());
                     cam.selected = model
                         .available_cameras
                         .iter()
@@ -156,6 +163,14 @@ pub fn load_composition(model: &mut Model, win: Rect, path: &std::path::Path) ->
                 lfo.chrome = chrome;
                 lfo.freq = saved.freq.unwrap_or(1.0).max(0.0);
                 ModuleBody::Lfo(lfo)
+            }
+            ModuleKind::Shader => {
+                // Ports and defaults come from the file, so they're built
+                // on the next tick, when the shader gets compiled.
+                let mut shader = ShaderState::new();
+                shader.chrome = chrome;
+                shader.select(saved.shader_file);
+                ModuleBody::Shader(shader)
             }
         };
 

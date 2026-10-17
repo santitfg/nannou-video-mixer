@@ -1,17 +1,21 @@
+mod gpu;
+mod graph;
 mod modules;
 mod save;
+mod settings;
 
-use modules::sources::camera::{discover_cameras, CameraWorker};
+use modules::sources::camera::{discover_cameras, CameraWatcher, CameraWorker};
+use modules::effects::shader_file::scan_library;
 use modules::{
-    base_height, body_color, has_config_row, has_output, input_count,
-    input_types, kind_label, module_frame, module_number, output_type, port_color,
-    push_module as modules_push_module, reaches, title_buttons_for, Connection, ModuleBody,
-    ModuleKind, PlacedModule, PortType, TitleButton, CATEGORIES,
+    body_color, has_config_row, has_output, kind_label, module_number, output_type,
+    port_color, push_module as modules_push_module, reaches, title_buttons_for, Connection,
+    ModuleBody, ModuleKind, PlacedModule, PortType, TitleButton, CATEGORIES, SHADER_PORT_STEP,
+    SHADER_PORT_TOP,
 };
-use nannou::image;
 use nannou::prelude::*;
 use nokhwa::utils::CameraInfo;
 use save::{load_composition, save_composition};
+use settings::Settings;
 use std::time::{Duration, Instant};
 
 const IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -27,10 +31,7 @@ const PREVIEW_H: f32 = 90.0;
 const DROPDOWN_ROW_H: f32 = 26.0;
 const NUMBER_DRAG_SENSITIVITY: f32 = 0.02;
 const FREQ_DRAG_SENSITIVITY: f32 = 0.01;
-
-/// A decoded video frame: width, height, RGBA bytes, and a monotonic
-/// version used to tell whether it's new since the last time it was read.
-pub type FrameData = (u32, u32, Vec<u8>, u64);
+const SCROLL_LINE_PIXELS: f32 = 40.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -41,13 +42,12 @@ enum View {
 
 /// State every module has regardless of kind: whether it's collapsed to
 /// just its title bar, whether its inline thumbnail is showing, and the
-/// cached texture backing that thumbnail (recreated lazily, at most one
-/// new texture anywhere in the app per tick — see `update`).
+/// texture backing that thumbnail, handed over by `graph::run_graph` each
+/// tick (the video itself never leaves the GPU).
 pub struct ModuleChrome {
     pub minimized: bool,
     pub show_preview: bool,
     pub preview_texture: Option<wgpu::Texture>,
-    pub preview_version: Option<u64>,
 }
 
 impl ModuleChrome {
@@ -56,7 +56,6 @@ impl ModuleChrome {
             minimized: false,
             show_preview: false,
             preview_texture: None,
-            preview_version: None,
         }
     }
 }
@@ -71,6 +70,11 @@ enum Drag {
     /// so each move applies a relative delta rather than an absolute
     /// position (unlike Slider, which is bounded 0..1).
     NumberKnob { id: u64, last_x: f32 },
+    /// Panning the canvas (middle button, or left + Shift); `last` is the
+    /// previous screen-space mouse position.
+    Pan { last: Vec2 },
+    /// Dragging one of the settings sliders (0 = scroll speed, 1 = drag speed).
+    Setting { index: usize },
 }
 
 enum SidebarRow {
@@ -92,11 +96,20 @@ pub struct Model {
     mouse_down: bool,
 
     pub available_cameras: Vec<CameraInfo>,
+    camera_watcher: CameraWatcher,
+    pub blend_pipeline: gpu::BlendPipeline,
+    /// File names found in the shaders folder (rescanned whenever a Shader's dropdown opens).
+    pub shader_library: Vec<String>,
     pub next_id: u64,
     pub modules: Vec<PlacedModule>,
     pub connections: Vec<Connection>,
     pub(crate) dragging: Option<Drag>,
     pub output_id: u64,
+    /// Canvas offset: a module at world position `p` is drawn at `p + pan`.
+    /// The canvas has no bounds; scrolling or dragging just moves this.
+    pan: Vec2,
+    settings: Settings,
+    settings_open: bool,
     status: Option<(String, bool, Instant)>,
 }
 
@@ -110,23 +123,30 @@ fn main() {
 
 fn model(app: &App) -> Model {
     let canvas = canvas_rect(app.window_rect());
+    let available_cameras = discover_cameras();
     let mut model = Model {
         view: View::Config,
         last_mouse_move: Instant::now(),
         mouse_down: false,
-        available_cameras: discover_cameras(),
+        camera_watcher: CameraWatcher::spawn(available_cameras.clone()),
+        available_cameras,
+        blend_pipeline: gpu::BlendPipeline::new(app.main_window().device()),
+        shader_library: scan_library(),
         next_id: 0,
         modules: Vec::new(),
         connections: Vec::new(),
         dragging: None,
         output_id: 0,
+        pan: Vec2::ZERO,
+        settings: Settings::load(),
+        settings_open: false,
         status: None,
     };
     model.output_id = push_module(&mut model, ModuleKind::Output, canvas.xy());
     model
 }
 
-fn update(app: &App, model: &mut Model, _update: Update) {
+fn update(app: &App, model: &mut Model, update: Update) {
     if model.view == View::FullscreenOverlay
         && !model.mouse_down
         && model.dragging.is_none()
@@ -138,6 +158,29 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     if let Some((_, _, at)) = &model.status {
         if at.elapsed() > SAVE_STATUS_TIMEOUT {
             model.status = None;
+        }
+    }
+
+    // Cameras plugged in or out while running: adopt the new list and
+    // re-attach every Camera module to its device by name.
+    while let Ok(list) = model.camera_watcher.updates.try_recv() {
+        let old = std::mem::replace(&mut model.available_cameras, list);
+        for module in &mut model.modules {
+            if let ModuleBody::Camera(cam) = &mut module.body {
+                cam.relink(&old, &model.available_cameras);
+            }
+        }
+    }
+
+    // A capture thread that died (device yanked mid-stream) leaves its
+    // module detached; the watcher re-attaches it if the camera returns.
+    for module in &mut model.modules {
+        if let ModuleBody::Camera(cam) = &mut module.body {
+            if cam.worker.as_ref().is_some_and(|w| !w.is_alive()) {
+                cam.worker = None;
+                cam.selected = None;
+                cam.gpu = None;
+            }
         }
     }
 
@@ -167,59 +210,7 @@ fn update(app: &App, model: &mut Model, _update: Update) {
         }
     }
 
-    refresh_one_texture(app, model);
-}
-
-/// Creates at most one new GPU texture per tick, across every module's own
-/// preview thumbnail plus Output's feed (Output always wins the race,
-/// since it drives the actual fullscreen display regardless of whether its
-/// own inline preview toggle is on). Multiple textures created within the
-/// same tick is the one thing that reliably correlated with a cross-camera
-/// preview glitch seen in practice, so this keeps it to one, globally.
-fn refresh_one_texture(app: &App, model: &mut Model) {
-    let output_id = model.output_id;
-    let output_version = model
-        .modules
-        .iter()
-        .find(|m| m.id == output_id)
-        .map(|m| m.body.chrome().preview_version);
-
-    let mut pending: Option<(u64, FrameData)> = None;
-
-    if let Some(current_version) = output_version {
-        if let Some(frame) = module_frame(&model.modules, &model.connections, output_id, &mut Vec::new()) {
-            if current_version != Some(frame.3) {
-                pending = Some((output_id, frame));
-            }
-        }
-    }
-
-    if pending.is_none() {
-        for module in &model.modules {
-            if !module.body.chrome().show_preview {
-                continue;
-            }
-            if let Some(frame) = module_frame(&model.modules, &model.connections, module.id, &mut Vec::new()) {
-                if module.body.chrome().preview_version != Some(frame.3) {
-                    pending = Some((module.id, frame));
-                    break;
-                }
-            }
-        }
-    }
-
-    let Some((id, (width, height, rgba, version))) = pending else {
-        return;
-    };
-    let Some(buffer) = image::RgbaImage::from_raw(width, height, rgba) else {
-        return;
-    };
-    let texture = wgpu::Texture::from_image(app, &image::DynamicImage::ImageRgba8(buffer));
-    if let Some(m) = model.modules.iter_mut().find(|m| m.id == id) {
-        let chrome = m.body.chrome_mut();
-        chrome.preview_texture = Some(texture);
-        chrome.preview_version = Some(version);
-    }
+    graph::run_graph(app, model, update.since_last.as_secs_f32());
 }
 
 fn event(app: &App, model: &mut Model, event: Event) {
@@ -229,13 +220,23 @@ fn event(app: &App, model: &mut Model, event: Event) {
     } = event
     {
         match window_event {
-            WindowEvent::MouseMoved(pos) => {
+            WindowEvent::MouseMoved(screen_pos) => {
                 model.last_mouse_move = Instant::now();
+                // Everything on the canvas lives in world space.
+                let pos = screen_pos - model.pan;
                 if model.view == View::Fullscreen {
                     model.view = View::FullscreenOverlay;
                 }
                 if model.view == View::Config {
                     match model.dragging {
+                        Some(Drag::Setting { index }) => {
+                            let t = slider_value_at(settings_slider_rect(app.window_rect(), index), screen_pos.x);
+                            set_setting(&mut model.settings, index, t);
+                        }
+                        Some(Drag::Pan { last }) => {
+                            model.pan += (screen_pos - last) * model.settings.drag_speed;
+                            model.dragging = Some(Drag::Pan { last: screen_pos });
+                        }
                         Some(Drag::Module { id, offset }) => {
                             if let Some(m) = model.modules.iter_mut().find(|m| m.id == id) {
                                 m.pos = pos + offset;
@@ -243,10 +244,7 @@ fn event(app: &App, model: &mut Model, event: Event) {
                         }
                         Some(Drag::Slider { id }) => {
                             if let Some(m) = model.modules.iter_mut().find(|m| m.id == id) {
-                                let chrome = m.body.chrome();
-                                let body =
-                                    module_body_rect(m.kind, m.pos, chrome.minimized, chrome.show_preview);
-                                let config = config_rect(body);
+                                let config = config_rect(module_body_rect(m));
                                 if let ModuleBody::Blend(blend) = &mut m.body {
                                     blend.mix = slider_value_at(config, pos.x);
                                 }
@@ -273,14 +271,45 @@ fn event(app: &App, model: &mut Model, event: Event) {
             }
             WindowEvent::MousePressed(button) => {
                 model.mouse_down = true;
-                if button == MouseButton::Left {
-                    handle_press(app, model);
+                let screen = pt2(app.mouse.x, app.mouse.y);
+                let can_pan = model.view == View::Config
+                    && model.dragging.is_none()
+                    && !sidebar_rect(app.window_rect()).contains(screen)
+                    && !(model.settings_open && settings_panel_rect(app.window_rect()).contains(screen));
+                if button == MouseButton::Middle && can_pan {
+                    model.dragging = Some(Drag::Pan { last: screen });
+                } else if button == MouseButton::Left {
+                    if can_pan && app.keys.mods.shift() {
+                        model.dragging = Some(Drag::Pan { last: screen });
+                    } else {
+                        handle_press(app, model);
+                    }
                 }
             }
             WindowEvent::MouseReleased(button) => {
                 model.mouse_down = false;
                 if button == MouseButton::Left {
                     handle_release(app, model);
+                } else if button == MouseButton::Middle && matches!(model.dragging, Some(Drag::Pan { .. })) {
+                    model.dragging = None;
+                }
+            }
+            WindowEvent::KeyPressed(Key::H) => {
+                if model.view == View::Config {
+                    center_on_modules(model, app.window_rect());
+                }
+            }
+            WindowEvent::MouseWheel(delta, _) => {
+                if model.view == View::Config {
+                    let mut d = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => vec2(x, y) * SCROLL_LINE_PIXELS,
+                        MouseScrollDelta::PixelDelta(p) => vec2(p.x as f32, p.y as f32),
+                    };
+                    // A plain mouse wheel only scrolls vertically; Shift sends it sideways.
+                    if app.keys.mods.shift() && d.x == 0.0 {
+                        d = vec2(d.y, 0.0);
+                    }
+                    model.pan += d * model.settings.scroll_speed;
                 }
             }
             _ => {}
@@ -310,36 +339,64 @@ fn handle_press(app: &App, model: &mut Model) {
     }
 }
 
-fn handle_press_config(model: &mut Model, win: Rect, mouse: Point2) {
+fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2) {
+    // Sidebar and buttons live in screen space; modules in world space.
+    let mouse = screen_mouse - model.pan;
+
     // A click anywhere while a dropdown is open either picks an option or
     // dismisses it; it never falls through to anything underneath.
-    if let Some(open_idx) = model.modules.iter().position(|m| {
-        matches!(&m.body, ModuleBody::Camera(cam) if cam.dropdown_open)
+    if let Some(open_idx) = model.modules.iter().position(|m| match &m.body {
+        ModuleBody::Camera(cam) => cam.dropdown_open,
+        ModuleBody::Shader(s) => s.dropdown_open,
+        _ => false,
     }) {
-        let available = model.available_cameras.clone();
-        let module = &model.modules[open_idx];
-        let chrome = module.body.chrome();
-        let body = module_body_rect(module.kind, module.pos, chrome.minimized, chrome.show_preview);
-        let selector = config_rect(body);
+        let options = dropdown_labels(model, &model.modules[open_idx]);
+        let selector = config_rect(module_body_rect(&model.modules[open_idx]));
 
         let mut choice = None;
-        for row in 0..(1 + available.len()) {
+        for row in 0..options.len() {
             if dropdown_option_rect(selector, row).contains(mouse) {
                 choice = Some(if row == 0 { None } else { Some(row - 1) });
                 break;
             }
         }
 
-        if let ModuleBody::Camera(cam) = &mut model.modules[open_idx].body {
-            cam.dropdown_open = false;
-            if let Some(pick) = choice {
-                cam.select(pick);
+        let library = model.shader_library.clone();
+        let available = model.available_cameras.clone();
+        match &mut model.modules[open_idx].body {
+            ModuleBody::Camera(cam) => {
+                cam.dropdown_open = false;
+                if let Some(pick) = choice {
+                    cam.select(pick, &available);
+                }
+            }
+            ModuleBody::Shader(shader) => {
+                shader.dropdown_open = false;
+                if let Some(pick) = choice {
+                    shader.select(pick.and_then(|i| library.get(i).cloned()));
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if settings_button_rect(win).contains(screen_mouse) {
+        model.settings_open = !model.settings_open;
+        return;
+    }
+    if model.settings_open && settings_panel_rect(win).contains(screen_mouse) {
+        for index in 0..2 {
+            let rect = settings_slider_rect(win, index);
+            if rect.pad(4.0).contains(screen_mouse) {
+                set_setting(&mut model.settings, index, slider_value_at(rect, screen_mouse.x));
+                model.dragging = Some(Drag::Setting { index });
             }
         }
         return;
     }
 
-    if save_button_rect(win).contains(mouse) {
+    if save_button_rect(win).contains(screen_mouse) {
         let (message, is_error) = match save_composition(model) {
             Ok(()) => (format!("Saved to {SAVE_PATH}"), false),
             Err(err) => (format!("Save failed: {err}"), true),
@@ -348,7 +405,7 @@ fn handle_press_config(model: &mut Model, win: Rect, mouse: Point2) {
         return;
     }
 
-    if load_button_rect(win).contains(mouse) {
+    if load_button_rect(win).contains(screen_mouse) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Composition (*.json)", &["json"])
             .set_file_name(SAVE_PATH)
@@ -368,11 +425,16 @@ fn handle_press_config(model: &mut Model, win: Rect, mouse: Point2) {
             plus_rect, kind, ..
         } = row
         {
-            if plus_rect.contains(mouse) {
+            if plus_rect.contains(screen_mouse) {
                 spawn_module(win, model, kind);
                 return;
             }
         }
+    }
+
+    // Modules scrolled underneath the sidebar can't be grabbed through it.
+    if sidebar_rect(win).contains(screen_mouse) {
+        return;
     }
 
     let available = model.available_cameras.clone();
@@ -384,7 +446,7 @@ fn handle_press_config(model: &mut Model, win: Rect, mouse: Point2) {
             let chrome = model.modules[i].body.chrome();
             (chrome.minimized, chrome.show_preview)
         };
-        let body = module_body_rect(kind, model.modules[i].pos, minimized, show_preview);
+        let body = module_body_rect(&model.modules[i]);
 
         let mut hit_button = false;
         for (slot, button) in title_buttons_for(kind).iter().enumerate() {
@@ -419,8 +481,17 @@ fn handle_press_config(model: &mut Model, win: Rect, mouse: Point2) {
                         }
                     }
                     ModuleBody::Blend(blend) => {
-                        blend.mix = slider_value_at(config, mouse.x);
-                        model.dragging = Some(Drag::Slider { id });
+                        // While a Number is plugged into Mix the slider is
+                        // just a readout; dragging it would do nothing.
+                        let driven = model.connections.iter().any(|c| c.to == id && c.to_input == 2);
+                        if !driven {
+                            blend.mix = slider_value_at(config, mouse.x);
+                            model.dragging = Some(Drag::Slider { id });
+                        }
+                    }
+                    ModuleBody::Shader(shader) => {
+                        shader.dropdown_open = true;
+                        model.shader_library = scan_library();
                     }
                     ModuleBody::Number(_) | ModuleBody::Lfo(_) => {
                         model.dragging = Some(Drag::NumberKnob { id, last_x: mouse.x });
@@ -436,10 +507,10 @@ fn handle_press_config(model: &mut Model, win: Rect, mouse: Point2) {
             return;
         }
 
-        let inputs = input_count(kind);
+        let inputs = model.modules[i].input_types().len();
         let mut hit_input = false;
         for input_index in 0..inputs {
-            if mouse.distance(module_input_port(body, input_index, inputs)) <= PORT_HIT_RADIUS {
+            if mouse.distance(module_input_port(kind, body, input_index, inputs)) <= PORT_HIT_RADIUS {
                 // Pick up whatever's already plugged in here, if anything,
                 // so it can be moved to a different input or unplugged.
                 if let Some(pos) = model
@@ -469,6 +540,15 @@ fn handle_press_config(model: &mut Model, win: Rect, mouse: Point2) {
 }
 
 fn handle_release(app: &App, model: &mut Model) {
+    if matches!(model.dragging, Some(Drag::Setting { .. })) {
+        model.dragging = None;
+        model.settings.save();
+        return;
+    }
+    if matches!(model.dragging, Some(Drag::Pan { .. })) {
+        model.dragging = None; // Shift+left pan ends with the left button
+        return;
+    }
     let drag = model.dragging.take();
     let Some(Drag::Cable { from }) = drag else {
         return;
@@ -483,16 +563,15 @@ fn handle_release(app: &App, model: &mut Model) {
         return;
     };
 
-    let mouse = pt2(app.mouse.x, app.mouse.y);
+    let mouse = pt2(app.mouse.x, app.mouse.y) - model.pan;
     let mut target = None;
 
     for module in &model.modules {
-        let types = input_types(module.kind);
+        let types = module.input_types();
         if types.is_empty() {
             continue;
         }
-        let chrome = module.body.chrome();
-        let body = module_body_rect(module.kind, module.pos, chrome.minimized, chrome.show_preview);
+        let body = module_body_rect(module);
         for (input_index, port_type) in types.iter().enumerate() {
             // A cable can only land on an input of the same signal type —
             // dropping a video cable on a number input (or vice versa)
@@ -500,7 +579,7 @@ fn handle_release(app: &App, model: &mut Model) {
             if *port_type != from_type {
                 continue;
             }
-            if mouse.distance(module_input_port(body, input_index, types.len())) <= PORT_HIT_RADIUS {
+            if mouse.distance(module_input_port(module.kind, body, input_index, types.len())) <= PORT_HIT_RADIUS {
                 target = Some((module.id, input_index));
                 break;
             }
@@ -524,9 +603,10 @@ fn push_module(model: &mut Model, kind: ModuleKind, pos: Point2) -> u64 {
 }
 
 fn spawn_module(win: Rect, model: &mut Model, kind: ModuleKind) {
+    // Land in the middle of what's currently on screen, whatever the pan.
     let canvas = canvas_rect(win);
     let count = model.modules.len() as f32;
-    let pos = canvas.xy() + vec2(30.0 * count, -30.0 * count);
+    let pos = canvas.xy() - model.pan + vec2(30.0 * count, -30.0 * count);
     push_module(model, kind, pos);
 }
 
@@ -554,6 +634,48 @@ fn load_button_rect(win: Rect) -> Rect {
     let sidebar = sidebar_rect(win);
     let w = (sidebar.w() - 16.0 - 8.0) / 2.0;
     Rect::from_x_y_w_h(sidebar.x() + w / 2.0 + 4.0, sidebar.top() - SIDEBAR_HEADER_H / 2.0, w, 32.0)
+}
+
+fn settings_button_rect(win: Rect) -> Rect {
+    let sidebar = sidebar_rect(win);
+    Rect::from_x_y_w_h(sidebar.x(), sidebar.bottom() + 28.0, sidebar.w() - 16.0, 32.0)
+}
+
+/// The floating settings panel, pinned to the canvas' top-right corner.
+fn settings_panel_rect(win: Rect) -> Rect {
+    Rect::from_w_h(300.0, 138.0).top_right_of(canvas_rect(win)).shift(vec2(-16.0, -16.0))
+}
+
+fn settings_slider_rect(win: Rect, index: usize) -> Rect {
+    let panel = settings_panel_rect(win);
+    Rect::from_x_y_w_h(panel.x(), panel.top() - 62.0 - index as f32 * 44.0, panel.w() - 32.0, 28.0)
+}
+
+/// Sliders are 0..1 on screen; this maps that onto the setting's real range.
+fn set_setting(settings: &mut Settings, index: usize, t: f32) {
+    let value = Settings::SPEED_MIN + t.clamp(0.0, 1.0) * (Settings::SPEED_MAX - Settings::SPEED_MIN);
+    match index {
+        0 => settings.scroll_speed = value,
+        _ => settings.drag_speed = value,
+    }
+}
+
+/// Pans so the box around every module sits in the middle of the canvas.
+fn center_on_modules(model: &mut Model, win: Rect) {
+    let mut bounds: Option<Rect> = None;
+    for module in &model.modules {
+        let body = module_body_rect(module);
+        bounds = Some(match bounds {
+            Some(b) => Rect::from_corners(
+                pt2(b.left().min(body.left()), b.bottom().min(body.bottom())),
+                pt2(b.right().max(body.right()), b.top().max(body.top())),
+            ),
+            None => body,
+        });
+    }
+    if let Some(b) = bounds {
+        model.pan = canvas_rect(win).xy() - b.xy();
+    }
 }
 
 fn sidebar_rows(win: Rect) -> Vec<SidebarRow> {
@@ -599,8 +721,12 @@ fn body_height(minimized: bool, show_preview: bool, base: f32) -> f32 {
     }
 }
 
-fn module_body_rect(kind: ModuleKind, pos: Point2, minimized: bool, show_preview: bool) -> Rect {
-    Rect::from_xy_wh(pos, vec2(MODULE_W, body_height(minimized, show_preview, base_height(kind))))
+fn module_body_rect(module: &PlacedModule) -> Rect {
+    let chrome = module.body.chrome();
+    Rect::from_xy_wh(
+        module.pos,
+        vec2(MODULE_W, body_height(chrome.minimized, chrome.show_preview, module.base_height())),
+    )
 }
 
 /// The one config-control slot beneath the title, shared by every kind
@@ -609,9 +735,11 @@ fn config_rect(body: Rect) -> Rect {
     Rect::from_x_y_w_h(body.x(), body.top() - 52.0, body.w() - 24.0, 32.0)
 }
 
-fn preview_rect(body: Rect, below_config_row: bool) -> Rect {
+/// `base` is the module's height without the preview strip; the strip sits
+/// in the extra room `body_height` adds below it.
+fn preview_rect(body: Rect, base: f32, below_config_row: bool) -> Rect {
     let y = if below_config_row {
-        body.top() - 52.0 - 16.0 - 8.0 - PREVIEW_H / 2.0
+        body.top() - (base - 22.0) - 8.0 - PREVIEW_H / 2.0
     } else {
         body.top() - 34.0 - 8.0 - PREVIEW_H / 2.0
     };
@@ -639,7 +767,14 @@ fn module_output_port(body: Rect) -> Point2 {
 
 /// Input ports are spaced evenly down the left edge; a single input sits
 /// dead center, matching every module that used to have exactly one.
-fn module_input_port(body: Rect, index: usize, total: usize) -> Point2 {
+fn module_input_port(kind: ModuleKind, body: Rect, index: usize, total: usize) -> Point2 {
+    // Shader ports hang below the file selector, one labelled row each.
+    if kind == ModuleKind::Shader {
+        if body.h() <= MINIMIZED_H {
+            return pt2(body.left(), body.y());
+        }
+        return pt2(body.left(), body.top() - SHADER_PORT_TOP - index as f32 * SHADER_PORT_STEP);
+    }
     if total <= 1 {
         return pt2(body.left(), body.y());
     }
@@ -669,26 +804,27 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
         View::Config => {
             draw.background().color(DIMGRAY);
 
+            let world = draw.translate(model.pan.extend(0.0));
             for module in &model.modules {
-                draw_module(&draw, model, module, app.time);
+                draw_module(&world, model, module, app.time);
             }
-            draw_cables(&draw, app, model);
+            draw_cables(&world, app, model);
 
             draw_button(&draw, start_button_rect(win), "Start Fullscreen");
             draw_sidebar(&draw, win, model);
+            if model.settings_open {
+                draw_settings_panel(&draw, win, &model.settings);
+            }
 
             // Open dropdown renders last so its options sit on top of everything.
             for module in &model.modules {
-                if let ModuleBody::Camera(cam) = &module.body {
-                    if cam.dropdown_open {
-                        let body = module_body_rect(
-                            module.kind,
-                            module.pos,
-                            cam.chrome.minimized,
-                            cam.chrome.show_preview,
-                        );
-                        draw_dropdown_options(&draw, body, &model.available_cameras);
-                    }
+                let open = match &module.body {
+                    ModuleBody::Camera(cam) => cam.dropdown_open,
+                    ModuleBody::Shader(shader) => shader.dropdown_open,
+                    _ => false,
+                };
+                if open {
+                    draw_dropdown_options(&world, module_body_rect(module), &dropdown_labels(model, module));
                 }
             }
         }
@@ -717,6 +853,7 @@ fn draw_sidebar(draw: &Draw, win: Rect, model: &Model) {
 
     let load_rect = load_button_rect(win);
     draw_button(draw, load_rect, "Load");
+    draw_button(draw, settings_button_rect(win), if model.settings_open { "Settings \u{25BE}" } else { "Settings" });
 
     if let Some((message, is_error, _)) = &model.status {
         draw.text(message)
@@ -770,7 +907,7 @@ fn draw_title_buttons(draw: &Draw, body: Rect, buttons: &[TitleButton]) {
 
 fn draw_module(draw: &Draw, model: &Model, module: &PlacedModule, now: f32) {
     let chrome = module.body.chrome();
-    let body = module_body_rect(module.kind, module.pos, chrome.minimized, chrome.show_preview);
+    let body = module_body_rect(module);
 
     draw.rect().xy(body.xy()).wh(body.wh()).color(body_color(module.kind));
     draw.rect()
@@ -800,7 +937,26 @@ fn draw_module(draw: &Draw, model: &Model, module: &PlacedModule, now: f32) {
                         .color(BLACK)
                         .font_size(12);
                 }
-                ModuleBody::Blend(blend) => draw_slider(draw, config, blend.mix),
+                ModuleBody::Blend(blend) => {
+                    let source = model
+                        .connections
+                        .iter()
+                        .find(|c| c.to == module.id && c.to_input == 2)
+                        .map(|c| c.from);
+                    let mix = source
+                        .and_then(|src| {
+                            module_number(&model.modules, &model.connections, src, now, &mut vec![module.id])
+                        })
+                        .unwrap_or(blend.mix);
+                    draw_slider(draw, config, mix, source.is_some());
+                }
+                ModuleBody::Shader(shader) => {
+                    draw_value_box(
+                        draw,
+                        config,
+                        &format!("{} \u{25BE}", shader.file.as_deref().unwrap_or("None")),
+                    );
+                }
                 ModuleBody::Number(number) => {
                     draw_value_box(draw, config, &format!("{:.2}", number.value));
                 }
@@ -822,7 +978,7 @@ fn draw_module(draw: &Draw, model: &Model, module: &PlacedModule, now: f32) {
         }
 
         if chrome.show_preview {
-            let preview = preview_rect(body, has_config_row(module.kind));
+            let preview = preview_rect(body, module.base_height(), has_config_row(module.kind));
             draw_preview(draw, preview, chrome.preview_texture.as_ref());
         }
     }
@@ -832,10 +988,33 @@ fn draw_module(draw: &Draw, model: &Model, module: &PlacedModule, now: f32) {
         draw_port(draw, module_output_port(body), port_type, connected);
     }
 
-    let types = input_types(module.kind);
+    let types = module.input_types();
     for (i, port_type) in types.iter().enumerate() {
         let connected = model.connections.iter().any(|c| c.to == module.id && c.to_input == i);
-        draw_port(draw, module_input_port(body, i, types.len()), *port_type, connected);
+        draw_port(draw, module_input_port(module.kind, body, i, types.len()), *port_type, connected);
+    }
+
+    if let (ModuleBody::Shader(shader), false) = (&module.body, chrome.minimized) {
+        for (i, label) in shader.port_labels().iter().enumerate() {
+            let port = module_input_port(module.kind, body, i, types.len());
+            draw.text(label)
+                .xy(port + vec2(16.0 + 80.0, 0.0))
+                .wh(vec2(160.0, 18.0))
+                .left_justify()
+                .color(WHITE)
+                .font_size(11);
+        }
+        if let Some(error) = &shader.error {
+            // Sits under the ports; the full text is also readable by
+            // fixing the file, since the shader reloads on save.
+            let ports_bottom = body.top() - SHADER_PORT_TOP - types.len() as f32 * SHADER_PORT_STEP;
+            draw.text(error)
+                .xy(pt2(body.x(), ports_bottom - 30.0))
+                .wh(vec2(body.w() - 16.0, 56.0))
+                .left_justify()
+                .color(rgb(1.0, 0.7, 0.7))
+                .font_size(10);
+        }
     }
 }
 
@@ -857,18 +1036,43 @@ fn draw_port(draw: &Draw, pos: Point2, port_type: PortType, connected: bool) {
     }
 }
 
-fn draw_slider(draw: &Draw, rect: Rect, mix: f32) {
+fn draw_settings_panel(draw: &Draw, win: Rect, settings: &Settings) {
+    let panel = settings_panel_rect(win);
+    draw.rect().xy(panel.xy()).wh(panel.wh()).color(rgb(0.13, 0.13, 0.13));
+    draw.rect().xy(panel.xy()).wh(panel.wh()).no_fill().stroke(BLACK).stroke_weight(2.0);
+    draw.text("Settings").xy(pt2(panel.x(), panel.top() - 18.0)).color(WHITE).font_size(16);
+
+    let range = Settings::SPEED_MAX - Settings::SPEED_MIN;
+    let rows = [("Scroll speed", settings.scroll_speed), ("Drag speed", settings.drag_speed)];
+    for (index, (label, value)) in rows.iter().enumerate() {
+        let rect = settings_slider_rect(win, index);
+        let t = (value - Settings::SPEED_MIN) / range;
+        draw_labeled_slider(draw, rect, t, &format!("{label} {:.2}x", value), false);
+    }
+}
+
+/// `driven`: the value comes from a connected Number, so it's a readout
+/// (drawn dimmer) rather than something to drag.
+fn draw_slider(draw: &Draw, rect: Rect, mix: f32, driven: bool) {
+    let label = format!("Mix {:.2}{}", mix, if driven { " (in)" } else { "" });
+    draw_labeled_slider(draw, rect, mix, &label, driven);
+}
+
+fn draw_labeled_slider(draw: &Draw, rect: Rect, mix: f32, label: &str, driven: bool) {
     draw.rect().xy(rect.xy()).wh(rect.wh()).color(SNOW);
     let fill_w = (rect.w() * mix).max(2.0);
     let fill = Rect::from_x_y_w_h(rect.left() + fill_w / 2.0, rect.y(), fill_w, rect.h());
-    draw.rect().xy(fill.xy()).wh(fill.wh()).color(STEELBLUE);
+    draw.rect()
+        .xy(fill.xy())
+        .wh(fill.wh())
+        .color(if driven { rgb8(150, 150, 150) } else { STEELBLUE });
     draw.rect()
         .xy(rect.xy())
         .wh(rect.wh())
         .no_fill()
         .stroke(rgb(0.4, 0.4, 0.4))
         .stroke_weight(1.0);
-    draw.text(&format!("Mix {:.2}", mix))
+    draw.text(label)
         .xy(rect.xy())
         .color(BLACK)
         .font_size(12);
@@ -887,11 +1091,24 @@ fn draw_value_box(draw: &Draw, rect: Rect, text: &str) {
     draw.text(text).xy(rect.xy()).color(BLACK).font_size(13);
 }
 
-fn draw_dropdown_options(draw: &Draw, body: Rect, available: &[CameraInfo]) {
-    let selector = config_rect(body);
-    let rows = 1 + available.len();
+/// Row labels for a module's open dropdown: "None" first, then each choice.
+fn dropdown_labels(model: &Model, module: &PlacedModule) -> Vec<String> {
+    let choices: Vec<String> = match &module.body {
+        ModuleBody::Camera(_) => model
+            .available_cameras
+            .iter()
+            .map(|c| c.human_name().to_string())
+            .collect(),
+        ModuleBody::Shader(_) => model.shader_library.clone(),
+        _ => Vec::new(),
+    };
+    std::iter::once("None".to_string()).chain(choices).collect()
+}
 
-    for row in 0..rows {
+fn draw_dropdown_options(draw: &Draw, body: Rect, labels: &[String]) {
+    let selector = config_rect(body);
+
+    for (row, label) in labels.iter().enumerate() {
         let rect = dropdown_option_rect(selector, row);
         draw.rect().xy(rect.xy()).wh(rect.wh()).color(WHITE);
         draw.rect()
@@ -900,12 +1117,7 @@ fn draw_dropdown_options(draw: &Draw, body: Rect, available: &[CameraInfo]) {
             .no_fill()
             .stroke(rgb(0.6, 0.6, 0.6))
             .stroke_weight(1.0);
-        let label = if row == 0 {
-            "None".to_string()
-        } else {
-            available[row - 1].human_name().to_string()
-        };
-        draw.text(&label)
+        draw.text(label)
             .xy(rect.xy())
             .wh(rect.wh())
             .color(BLACK)
@@ -943,16 +1155,17 @@ fn draw_cables(draw: &Draw, app: &App, model: &Model) {
         let from = model.modules.iter().find(|m| m.id == c.from);
         let to = model.modules.iter().find(|m| m.id == c.to);
         if let (Some(from), Some(to)) = (from, to) {
-            let from_chrome = from.body.chrome();
-            let from_body =
-                module_body_rect(from.kind, from.pos, from_chrome.minimized, from_chrome.show_preview);
-            let to_chrome = to.body.chrome();
-            let to_body = module_body_rect(to.kind, to.pos, to_chrome.minimized, to_chrome.show_preview);
+            let from_body = module_body_rect(from);
+            let to_body = module_body_rect(to);
+            let to_inputs = to.input_types().len();
+            if c.to_input >= to_inputs {
+                continue;
+            }
             let color = output_type(from.kind).map(port_color).unwrap_or(LIGHTGRAY);
 
             draw.line()
                 .start(module_output_port(from_body))
-                .end(module_input_port(to_body, c.to_input, input_count(to.kind)))
+                .end(module_input_port(to.kind, to_body, c.to_input, to_inputs))
                 .weight(4.0)
                 .color(color);
         }
@@ -960,12 +1173,11 @@ fn draw_cables(draw: &Draw, app: &App, model: &Model) {
 
     if let Some(Drag::Cable { from }) = &model.dragging {
         if let Some(module) = model.modules.iter().find(|m| m.id == *from) {
-            let chrome = module.body.chrome();
-            let body = module_body_rect(module.kind, module.pos, chrome.minimized, chrome.show_preview);
+            let body = module_body_rect(module);
             let color = output_type(module.kind).map(port_color).unwrap_or(LIGHTGRAY);
             draw.line()
                 .start(module_output_port(body))
-                .end(pt2(app.mouse.x, app.mouse.y))
+                .end(pt2(app.mouse.x, app.mouse.y) - model.pan)
                 .weight(4.0)
                 .color(color);
         }

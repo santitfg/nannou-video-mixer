@@ -12,14 +12,16 @@ directly with the **Load** button, which opens a native file picker.
   "modules": [
     {
       "id": 0,
-      "kind": "camera" | "blend" | "output",
+      "kind": "camera" | "blend" | "output" | "number" | "mult" | "lfo" | "shader",
       "pos": [x, y],        // canvas position, center-origin
       "minimized": false,
       "show_preview": false,
       "camera_name": "...", // camera modules only: must match a device's
                              // name exactly as it appears in that module's
                              // dropdown — adjust this to your own hardware
-      "mix": 0.5             // blend modules only: 0 = input 0, 1 = input 1
+      "mix": 0.5,            // blend modules only: 0 = input 0, 1 = input 1
+                             // (overridden while a Number is plugged into input 2)
+      "shader_file": "..."   // shader modules only: file name in ./shaders
     }
   ],
   "connections": [

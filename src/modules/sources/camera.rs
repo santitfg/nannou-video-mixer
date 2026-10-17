@@ -1,8 +1,11 @@
-use crate::{FrameData, ModuleChrome};
+use crate::gpu::{create_texture, write_rgba, VideoTex};
+use crate::ModuleChrome;
+use wgpu_upstream as wgpu;
 use nokhwa::pixel_format::RgbAFormat;
 use nokhwa::utils::{ApiBackend, CameraIndex, CameraInfo, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -26,16 +29,35 @@ struct CamFrame {
 pub struct CameraWorker {
     frame: Arc<Mutex<Option<CamFrame>>>,
     stop: Arc<AtomicBool>,
+    /// False once the capture thread has exited (device unplugged, failed
+    /// to open, ...).
+    alive: Arc<AtomicBool>,
 }
+
+/// Flips `alive` off when the capture thread ends, however it ends.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// How many failed grabs in a row (~20 ms apart) before a camera is
+/// considered gone.
+const MAX_CONSECUTIVE_ERRORS: u32 = 100;
 
 impl CameraWorker {
     pub fn spawn(index: CameraIndex) -> Self {
         let frame = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
 
         let frame_handle = frame.clone();
         let stop_handle = stop.clone();
+        let alive_handle = alive.clone();
         thread::spawn(move || {
+            let _guard = AliveGuard(alive_handle);
             let requested =
                 RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
             let mut camera = match Camera::new(index, requested) {
@@ -47,12 +69,22 @@ impl CameraWorker {
             }
 
             let mut version = 0u64;
+            let mut errors = 0u32;
             while !stop_handle.load(Ordering::Relaxed) {
                 let frame = {
                     let _guard = FRAME_LOCK.lock().unwrap();
                     camera.frame()
                 };
-                if let Ok(buffer) = frame {
+                let Ok(buffer) = frame else {
+                    errors += 1;
+                    if errors >= MAX_CONSECUTIVE_ERRORS {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                errors = 0;
+                {
                     if let Ok(decoded) = buffer.decode_image::<RgbAFormat>() {
                         version += 1;
                         let (width, height) = decoded.dimensions();
@@ -68,15 +100,37 @@ impl CameraWorker {
             let _ = camera.stop_stream();
         });
 
-        CameraWorker { frame, stop }
+        CameraWorker { frame, stop, alive }
     }
 
-    pub fn latest(&self) -> Option<FrameData> {
-        self.frame
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|f| (f.width, f.height, f.rgba.clone(), f.version))
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Uploads the newest captured frame into `slot` if it's newer than
+    /// what's already there, and returns the texture. The upload copies
+    /// straight from the capture thread's buffer under its lock; nothing is
+    /// cloned.
+    pub fn upload(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: &mut Option<(VideoTex, u64)>,
+    ) -> Option<VideoTex> {
+        if let Some(f) = self.frame.lock().unwrap().as_ref() {
+            let fresh = !matches!(slot, Some((t, v)) if *v == f.version && (t.width, t.height) == (f.width, f.height));
+            if fresh && f.rgba.len() == (f.width * f.height * 4) as usize {
+                let reuse = matches!(slot, Some((t, _)) if (t.width, t.height) == (f.width, f.height));
+                if !reuse {
+                    let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+                    *slot = Some((create_texture(device, f.width, f.height, usage), 0));
+                }
+                let (tex, version) = slot.as_mut().unwrap();
+                write_rgba(queue, tex, &f.rgba);
+                *version = f.version;
+            }
+        }
+        slot.as_ref().map(|(t, _)| t.clone())
     }
 }
 
@@ -89,9 +143,15 @@ impl Drop for CameraWorker {
 /// The CAMERA module's own config: which device, and its capture thread.
 pub struct CameraState {
     pub chrome: ModuleChrome,
+    /// Index into the current camera list; `None` while the wanted camera isn't plugged in.
     pub selected: Option<usize>,
+    /// The camera this module is meant to use, by name. Survives the device
+    /// being unplugged so it can reattach when it comes back.
+    pub wanted: Option<String>,
     pub worker: Option<CameraWorker>,
     pub dropdown_open: bool,
+    /// The latest frame on the GPU, and the capture version it came from.
+    pub gpu: Option<(VideoTex, u64)>,
 }
 
 impl CameraState {
@@ -99,27 +159,47 @@ impl CameraState {
         CameraState {
             chrome: ModuleChrome::new(),
             selected: None,
+            wanted: None,
             worker: None,
             dropdown_open: false,
+            gpu: None,
         }
     }
 
     pub fn label(&self, available: &[CameraInfo]) -> String {
-        match self.selected.and_then(|i| available.get(i)) {
-            Some(info) => info.human_name().to_string(),
-            None if available.is_empty() => "No cameras found".to_string(),
-            None => "Select a camera".to_string(),
+        match (self.selected.and_then(|i| available.get(i)), &self.wanted) {
+            (Some(info), _) => info.human_name().to_string(),
+            (None, Some(name)) => format!("{name} (disconnected)"),
+            (None, None) if available.is_empty() => "No cameras found".to_string(),
+            (None, None) => "Select a camera".to_string(),
         }
     }
 
     /// Only records the pick; the worker lifecycle pass in `update` starts
     /// or stops the actual capture thread based on whether this module is
     /// in use, so an idle selection never keeps a device streaming.
-    pub fn select(&mut self, choice: Option<usize>) {
+    pub fn select(&mut self, choice: Option<usize>, available: &[CameraInfo]) {
         self.selected = choice;
+        self.wanted = choice.and_then(|i| available.get(i)).map(|c| c.human_name().to_string());
         self.worker = None;
         self.chrome.preview_texture = None;
-        self.chrome.preview_version = None;
+        self.gpu = None;
+    }
+
+    /// The camera list changed: find `wanted` in it again. The capture thread
+    /// is only restarted if the device's index actually moved (or it's gone),
+    /// so an unrelated plug/unplug doesn't interrupt a running camera.
+    pub fn relink(&mut self, old: &[CameraInfo], new: &[CameraInfo]) {
+        let before = self.selected.and_then(|i| old.get(i)).map(|c| c.index().clone());
+        self.selected = self
+            .wanted
+            .as_ref()
+            .and_then(|name| new.iter().position(|c| c.human_name() == *name));
+        let after = self.selected.and_then(|i| new.get(i)).map(|c| c.index().clone());
+        if before != after {
+            self.worker = None;
+            self.gpu = None;
+        }
     }
 }
 
@@ -201,4 +281,62 @@ fn camera_produces_frame(index: CameraIndex) -> bool {
         let _ = tx.send(ok);
     });
     rx.recv_timeout(Duration::from_millis(2500)).unwrap_or(false)
+}
+
+/// Polls for cameras being plugged in or unplugged while the app runs, and
+/// sends the new list whenever it changes. Listing devices is cheap; the
+/// expensive "does this node actually stream" probe only runs for a camera
+/// that wasn't in the previous list, so running cameras are left alone.
+pub struct CameraWatcher {
+    pub updates: Receiver<Vec<CameraInfo>>,
+}
+
+const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+
+impl CameraWatcher {
+    pub fn spawn(initial: Vec<CameraInfo>) -> Self {
+        let (tx, updates) = channel();
+        thread::spawn(move || {
+            let mut known = initial;
+            loop {
+                thread::sleep(WATCH_INTERVAL);
+                let Ok(raw) = nokhwa::query(ApiBackend::Auto) else { continue };
+
+                let mut groups: Vec<(String, Vec<CameraInfo>)> = Vec::new();
+                for info in raw {
+                    let name = info.human_name().to_string();
+                    match groups.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, list)) => list.push(info),
+                        None => groups.push((name, vec![info])),
+                    }
+                }
+
+                let current: Vec<CameraInfo> = groups
+                    .into_iter()
+                    .map(|(name, candidates)| {
+                        let still_there = known
+                            .iter()
+                            .find(|k| k.human_name() == name && candidates.iter().any(|c| c.index() == k.index()));
+                        match still_there {
+                            Some(k) => k.clone(),
+                            None => pick_working_camera(candidates),
+                        }
+                    })
+                    .collect();
+
+                let same = current.len() == known.len()
+                    && current
+                        .iter()
+                        .zip(&known)
+                        .all(|(a, b)| a.human_name() == b.human_name() && a.index() == b.index());
+                if !same {
+                    known = current.clone();
+                    if tx.send(current).is_err() {
+                        return; // app is gone
+                    }
+                }
+            }
+        });
+        CameraWatcher { updates }
+    }
 }

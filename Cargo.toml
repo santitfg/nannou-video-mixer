@@ -9,6 +9,17 @@ nokhwa = { version = "0.10", features = ["input-native", "output-threaded", "dec
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Same wgpu nannou uses; the extra feature lets us hand it a pre-validated naga module.
+wgpu_upstream = { package = "wgpu", version = "0.17", features = ["naga"] }
+naga = { version = "0.13", features = ["glsl-in", "validate"] }
 
 [profile.release]
+opt-level = 3
+
+[dev-dependencies]
+pollster = "0.4"
+
+# Camera MJPEG decoding, image resizing etc. are far too slow unoptimized;
+# keep our own code debuggable but build dependencies with optimizations.
+[profile.dev.package."*"]
 opt-level = 3
