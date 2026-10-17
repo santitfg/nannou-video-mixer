@@ -1,3 +1,4 @@
+mod debug_log;
 mod gpu;
 mod graph;
 mod modules;
@@ -16,6 +17,7 @@ use nannou::prelude::*;
 use nokhwa::utils::CameraInfo;
 use save::{load_composition, save_composition};
 use settings::Settings;
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 const IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -47,7 +49,7 @@ enum View {
 pub struct ModuleChrome {
     pub minimized: bool,
     pub show_preview: bool,
-    pub preview_texture: Option<wgpu::Texture>,
+    pub preview_texture: Option<gpu::DrawTex>,
 }
 
 impl ModuleChrome {
@@ -98,6 +100,7 @@ pub struct Model {
     pub available_cameras: Vec<CameraInfo>,
     camera_watcher: CameraWatcher,
     pub blend_pipeline: gpu::BlendPipeline,
+    pub yuyv_pipeline: gpu::YuyvPipeline,
     /// File names found in the shaders folder (rescanned whenever a Shader's dropdown opens).
     pub shader_library: Vec<String>,
     pub next_id: u64,
@@ -110,7 +113,88 @@ pub struct Model {
     pan: Vec2,
     settings: Settings,
     settings_open: bool,
+    /// The hidden Debug section of the settings panel is expanded.
+    debug_open: bool,
     status: Option<(String, bool, Instant)>,
+    fps: FpsCounter,
+    pub(crate) timings: Timings,
+    /// Time spent in `view` since the last `update` (`view` only gets `&Model`).
+    view_time: Cell<Duration>,
+}
+
+/// Frames per second over the last quarter second, as ready-to-draw text.
+struct FpsCounter {
+    since: Instant,
+    frames: u32,
+    label: String,
+}
+
+impl FpsCounter {
+    fn new() -> Self {
+        FpsCounter { since: Instant::now(), frames: 0, label: String::from("-- fps") }
+    }
+
+    fn tick(&mut self) {
+        self.frames += 1;
+        let elapsed = self.since.elapsed().as_secs_f32();
+        if elapsed >= 0.25 {
+            let fps = self.frames as f32 / elapsed;
+            self.label = format!("{fps:.1} fps \u{00B7} {:.1} ms", 1000.0 / fps);
+            self.since = Instant::now();
+            self.frames = 0;
+        }
+    }
+}
+
+/// Where the main thread's time goes, summed and logged once a second.
+pub(crate) struct Timings {
+    since: Instant,
+    frames: u32,
+    update: Duration,
+    pub(crate) uploads: Duration,
+    view: Duration,
+}
+
+impl Timings {
+    fn new() -> Self {
+        Timings { since: Instant::now(), frames: 0, update: Duration::ZERO, uploads: Duration::ZERO, view: Duration::ZERO }
+    }
+
+    fn report_every_second(&mut self) {
+        let elapsed = self.since.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let n = self.frames.max(1) as f32;
+        let ms = |d: Duration| d.as_secs_f32() * 1000.0 / n;
+        dlog!(
+            "main: {:.1} fps | update {:.2}ms (camera uploads {:.2}ms) | view {:.2}ms",
+            self.frames as f32 / elapsed.as_secs_f32(),
+            ms(self.update),
+            ms(self.uploads),
+            ms(self.view)
+        );
+        *self = Timings::new();
+    }
+}
+
+/// The on/off rows under the settings sliders.
+#[derive(Clone, Copy)]
+enum SettingsToggle {
+    ShowFps,
+    /// Expands/collapses the rows below; not a setting itself.
+    DebugSection,
+    DebugLog,
+    SerializeGrabs,
+}
+
+fn settings_toggles(debug_open: bool) -> &'static [SettingsToggle] {
+    use SettingsToggle::*;
+    if debug_open {
+        &[ShowFps, DebugSection, DebugLog, SerializeGrabs]
+    } else {
+        &[ShowFps, DebugSection]
+    }
 }
 
 fn main() {
@@ -123,7 +207,10 @@ fn main() {
 
 fn model(app: &App) -> Model {
     let canvas = canvas_rect(app.window_rect());
+    let settings = Settings::load();
+    settings.apply_globals();
     let available_cameras = discover_cameras();
+    dlog!("cameras found: {}", camera_names(&available_cameras));
     let mut model = Model {
         view: View::Config,
         last_mouse_move: Instant::now(),
@@ -131,6 +218,7 @@ fn model(app: &App) -> Model {
         camera_watcher: CameraWatcher::spawn(available_cameras.clone()),
         available_cameras,
         blend_pipeline: gpu::BlendPipeline::new(app.main_window().device()),
+        yuyv_pipeline: gpu::YuyvPipeline::new(app.main_window().device()),
         shader_library: scan_library(),
         next_id: 0,
         modules: Vec::new(),
@@ -138,15 +226,26 @@ fn model(app: &App) -> Model {
         dragging: None,
         output_id: 0,
         pan: Vec2::ZERO,
-        settings: Settings::load(),
+        settings,
         settings_open: false,
+        debug_open: false,
         status: None,
+        fps: FpsCounter::new(),
+        timings: Timings::new(),
+        view_time: Cell::new(Duration::ZERO),
     };
     model.output_id = push_module(&mut model, ModuleKind::Output, canvas.xy());
     model
 }
 
+fn camera_names(cameras: &[CameraInfo]) -> String {
+    cameras.iter().map(|c| c.human_name()).collect::<Vec<_>>().join(", ")
+}
+
 fn update(app: &App, model: &mut Model, update: Update) {
+    let started = Instant::now();
+    model.fps.tick();
+
     if model.view == View::FullscreenOverlay
         && !model.mouse_down
         && model.dragging.is_none()
@@ -164,6 +263,7 @@ fn update(app: &App, model: &mut Model, update: Update) {
     // Cameras plugged in or out while running: adopt the new list and
     // re-attach every Camera module to its device by name.
     while let Ok(list) = model.camera_watcher.updates.try_recv() {
+        dlog!("camera list changed: {}", camera_names(&list));
         let old = std::mem::replace(&mut model.available_cameras, list);
         for module in &mut model.modules {
             if let ModuleBody::Camera(cam) = &mut module.body {
@@ -177,9 +277,9 @@ fn update(app: &App, model: &mut Model, update: Update) {
     for module in &mut model.modules {
         if let ModuleBody::Camera(cam) = &mut module.body {
             if cam.worker.as_ref().is_some_and(|w| !w.is_alive()) {
+                dlog!("camera module {}: capture thread ended, detaching", module.id);
                 cam.worker = None;
                 cam.selected = None;
-                cam.gpu = None;
             }
         }
     }
@@ -211,6 +311,12 @@ fn update(app: &App, model: &mut Model, update: Update) {
     }
 
     graph::run_graph(app, model, update.since_last.as_secs_f32());
+
+    let timings = &mut model.timings;
+    timings.frames += 1;
+    timings.update += started.elapsed();
+    timings.view += model.view_time.take();
+    timings.report_every_second();
 }
 
 fn event(app: &App, model: &mut Model, event: Event) {
@@ -275,7 +381,7 @@ fn event(app: &App, model: &mut Model, event: Event) {
                 let can_pan = model.view == View::Config
                     && model.dragging.is_none()
                     && !sidebar_rect(app.window_rect()).contains(screen)
-                    && !(model.settings_open && settings_panel_rect(app.window_rect()).contains(screen));
+                    && !(model.settings_open && settings_panel_rect(app.window_rect(), model.debug_open).contains(screen));
                 if button == MouseButton::Middle && can_pan {
                     model.dragging = Some(Drag::Pan { last: screen });
                 } else if button == MouseButton::Left {
@@ -385,13 +491,28 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2) {
         model.settings_open = !model.settings_open;
         return;
     }
-    if model.settings_open && settings_panel_rect(win).contains(screen_mouse) {
+    if model.settings_open && settings_panel_rect(win, model.debug_open).contains(screen_mouse) {
         for index in 0..2 {
             let rect = settings_slider_rect(win, index);
             if rect.pad(4.0).contains(screen_mouse) {
                 set_setting(&mut model.settings, index, slider_value_at(rect, screen_mouse.x));
                 model.dragging = Some(Drag::Setting { index });
             }
+        }
+        let toggles = settings_toggles(model.debug_open);
+        if let Some(row) = (0..toggles.len()).find(|&row| settings_toggle_rect(win, row).contains(screen_mouse)) {
+            let settings = &mut model.settings;
+            match toggles[row] {
+                SettingsToggle::DebugSection => model.debug_open = !model.debug_open,
+                SettingsToggle::ShowFps => settings.show_fps = !settings.show_fps,
+                SettingsToggle::DebugLog => settings.debug_log = !settings.debug_log,
+                SettingsToggle::SerializeGrabs => {
+                    settings.serialize_camera_grabs = !settings.serialize_camera_grabs;
+                    dlog!("serialize camera grabs: {}", settings.serialize_camera_grabs);
+                }
+            }
+            settings.apply_globals();
+            settings.save();
         }
         return;
     }
@@ -641,14 +762,26 @@ fn settings_button_rect(win: Rect) -> Rect {
     Rect::from_x_y_w_h(sidebar.x(), sidebar.bottom() + 28.0, sidebar.w() - 16.0, 32.0)
 }
 
-/// The floating settings panel, pinned to the canvas' top-right corner.
-fn settings_panel_rect(win: Rect) -> Rect {
-    Rect::from_w_h(300.0, 138.0).top_right_of(canvas_rect(win)).shift(vec2(-16.0, -16.0))
+const SETTINGS_TOGGLE_TOP: f32 = 150.0;
+const SETTINGS_TOGGLE_STEP: f32 = 36.0;
+
+/// The floating settings panel, pinned to the canvas' top-right corner; it
+/// grows when the Debug section is expanded.
+fn settings_panel_rect(win: Rect, debug_open: bool) -> Rect {
+    let rows = settings_toggles(debug_open).len() as f32;
+    let h = SETTINGS_TOGGLE_TOP + (rows - 1.0) * SETTINGS_TOGGLE_STEP + 32.0;
+    Rect::from_w_h(300.0, h).top_right_of(canvas_rect(win)).shift(vec2(-16.0, -16.0))
 }
 
 fn settings_slider_rect(win: Rect, index: usize) -> Rect {
-    let panel = settings_panel_rect(win);
+    let panel = settings_panel_rect(win, false); // rows only move the bottom edge
     Rect::from_x_y_w_h(panel.x(), panel.top() - 62.0 - index as f32 * 44.0, panel.w() - 32.0, 28.0)
+}
+
+fn settings_toggle_rect(win: Rect, row: usize) -> Rect {
+    let panel = settings_panel_rect(win, false);
+    let y = panel.top() - SETTINGS_TOGGLE_TOP - row as f32 * SETTINGS_TOGGLE_STEP;
+    Rect::from_x_y_w_h(panel.x(), y, panel.w() - 32.0, 28.0)
 }
 
 /// Sliders are 0..1 on screen; this maps that onto the setting's real range.
@@ -797,6 +930,7 @@ fn exit_button_rect(win: Rect) -> Rect {
 // --- Drawing -----------------------------------------------------------
 
 fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
+    let started = Instant::now();
     let draw = app.draw();
     let win = app.window_rect();
 
@@ -813,7 +947,10 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
             draw_button(&draw, start_button_rect(win), "Start Fullscreen");
             draw_sidebar(&draw, win, model);
             if model.settings_open {
-                draw_settings_panel(&draw, win, &model.settings);
+                draw_settings_panel(&draw, win, &model.settings, model.debug_open);
+            }
+            if model.settings.debug_log {
+                draw_debug_log(&draw, win);
             }
 
             // Open dropdown renders last so its options sit on top of everything.
@@ -838,7 +975,45 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
         }
     }
 
+    if model.settings.show_fps {
+        let area = if model.view == View::Config { canvas_rect(win) } else { win };
+        draw_fps(&draw, area, &model.fps.label);
+    }
+
     draw.to_frame(app, &render_frame).unwrap();
+    model.view_time.set(model.view_time.get() + started.elapsed());
+}
+
+fn draw_fps(draw: &Draw, area: Rect, label: &str) {
+    let rect = Rect::from_w_h(150.0, 22.0).top_left_of(area).shift(vec2(8.0, -8.0));
+    draw.rect().xy(rect.xy()).wh(rect.wh()).color(rgba(0.0, 0.0, 0.0, 0.6));
+    draw.text(label)
+        .xy(rect.xy() + vec2(6.0, 0.0))
+        .wh(rect.wh())
+        .left_justify()
+        .color(LIMEGREEN)
+        .font_size(12);
+}
+
+const DEBUG_LOG_LINES: usize = 14;
+const DEBUG_LOG_LINE_H: f32 = 14.0;
+
+/// The newest debug-log lines, in a translucent strip above the Start button.
+fn draw_debug_log(draw: &Draw, win: Rect) {
+    let canvas = canvas_rect(win);
+    let h = DEBUG_LOG_LINES as f32 * DEBUG_LOG_LINE_H + 16.0;
+    let panel = Rect::from_w_h(canvas.w() - 32.0, h).mid_bottom_of(canvas).shift_y(84.0);
+    draw.rect().xy(panel.xy()).wh(panel.wh()).color(rgba(0.0, 0.0, 0.0, 0.75));
+    for (i, line) in debug_log::recent(DEBUG_LOG_LINES).iter().enumerate() {
+        let y = panel.top() - 8.0 - DEBUG_LOG_LINE_H / 2.0 - i as f32 * DEBUG_LOG_LINE_H;
+        draw.text(line)
+            .xy(pt2(panel.x(), y))
+            .wh(vec2(panel.w() - 16.0, DEBUG_LOG_LINE_H))
+            .left_justify()
+            .no_line_wrap()
+            .color(LIGHTGRAY)
+            .font_size(11);
+    }
 }
 
 fn draw_sidebar(draw: &Draw, win: Rect, model: &Model) {
@@ -1036,8 +1211,8 @@ fn draw_port(draw: &Draw, pos: Point2, port_type: PortType, connected: bool) {
     }
 }
 
-fn draw_settings_panel(draw: &Draw, win: Rect, settings: &Settings) {
-    let panel = settings_panel_rect(win);
+fn draw_settings_panel(draw: &Draw, win: Rect, settings: &Settings, debug_open: bool) {
+    let panel = settings_panel_rect(win, debug_open);
     draw.rect().xy(panel.xy()).wh(panel.wh()).color(rgb(0.13, 0.13, 0.13));
     draw.rect().xy(panel.xy()).wh(panel.wh()).no_fill().stroke(BLACK).stroke_weight(2.0);
     draw.text("Settings").xy(pt2(panel.x(), panel.top() - 18.0)).color(WHITE).font_size(16);
@@ -1049,6 +1224,38 @@ fn draw_settings_panel(draw: &Draw, win: Rect, settings: &Settings) {
         let t = (value - Settings::SPEED_MIN) / range;
         draw_labeled_slider(draw, rect, t, &format!("{label} {:.2}x", value), false);
     }
+
+    for (row, toggle) in settings_toggles(debug_open).iter().enumerate() {
+        let rect = settings_toggle_rect(win, row);
+        let (label, on) = match toggle {
+            SettingsToggle::ShowFps => ("Show FPS", settings.show_fps),
+            SettingsToggle::DebugSection => {
+                let label = if debug_open { "Debug \u{25BE}" } else { "Debug \u{25B8}" };
+                draw.text(label).xy(rect.xy()).wh(rect.wh()).left_justify().color(GRAY).font_size(12);
+                continue;
+            }
+            SettingsToggle::DebugLog => ("Debug log", settings.debug_log),
+            SettingsToggle::SerializeGrabs => ("Serialize camera grabs", settings.serialize_camera_grabs),
+        };
+        draw_toggle(draw, rect, label, on);
+    }
+}
+
+fn draw_toggle(draw: &Draw, rect: Rect, label: &str, on: bool) {
+    draw_value_box(draw, rect, "");
+    draw.text(label)
+        .xy(rect.xy() + vec2(8.0, 0.0))
+        .wh(rect.wh())
+        .left_justify()
+        .color(BLACK)
+        .font_size(12);
+    let check = Rect::from_w_h(16.0, 16.0).mid_right_of(rect).shift_x(-8.0);
+    draw.rect()
+        .xy(check.xy())
+        .wh(check.wh())
+        .color(if on { STEELBLUE } else { WHITE })
+        .stroke(rgb(0.4, 0.4, 0.4))
+        .stroke_weight(1.0);
 }
 
 /// `driven`: the value comes from a connected Number, so it's a readout
@@ -1125,13 +1332,13 @@ fn draw_dropdown_options(draw: &Draw, body: Rect, labels: &[String]) {
     }
 }
 
-fn draw_preview(draw: &Draw, rect: Rect, texture: Option<&wgpu::Texture>) {
+fn draw_preview(draw: &Draw, rect: Rect, texture: Option<&gpu::DrawTex>) {
     draw.rect().xy(rect.xy()).wh(rect.wh()).color(BLACK);
     match texture {
         Some(texture) => {
-            let [img_w, img_h] = texture.size();
+            let [img_w, img_h] = texture.view.size();
             let scale = (rect.w() / img_w as f32).min(rect.h() / img_h as f32);
-            draw.texture(texture)
+            draw.texture(&texture.view)
                 .xy(rect.xy())
                 .w_h(img_w as f32 * scale, img_h as f32 * scale);
         }
@@ -1207,9 +1414,9 @@ fn draw_output_signal(draw: &Draw, win: Rect, model: &Model) {
 
     match texture {
         Some(texture) => {
-            let [img_w, img_h] = texture.size();
+            let [img_w, img_h] = texture.view.size();
             let scale = (win.w() / img_w as f32).min(win.h() / img_h as f32);
-            draw.texture(texture)
+            draw.texture(&texture.view)
                 .w_h(img_w as f32 * scale, img_h as f32 * scale);
         }
         None => {

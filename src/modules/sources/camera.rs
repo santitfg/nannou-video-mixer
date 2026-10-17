@@ -1,33 +1,70 @@
-use crate::gpu::{create_texture, write_rgba, VideoTex};
+use crate::gpu::{ensure_texture, write_rgba, VideoTex, YuyvPipeline};
 use crate::ModuleChrome;
 use wgpu_upstream as wgpu;
 use nokhwa::pixel_format::RgbAFormat;
-use nokhwa::utils::{ApiBackend, CameraIndex, CameraInfo, RequestedFormat, RequestedFormatType};
+use nokhwa::utils::{ApiBackend, CameraIndex, CameraInfo, FrameFormat, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
+use crate::dlog;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Serializes the actual frame-grab call across every camera thread.
 /// Two `nokhwa` `Camera` instances pulling frames concurrently from
 /// different threads can end up delivering one camera's data into the
 /// other's buffer — this forces frame grabs one at a time so that can't
 /// happen, even though each camera otherwise runs on its own thread.
+///
+/// `frame()` blocks until the next frame arrives, so holding this makes
+/// every camera wait out the others' frame intervals; it's only taken
+/// while `SERIALIZE_GRABS` is on (Settings → Debug).
 static FRAME_LOCK: Mutex<()> = Mutex::new(());
+static SERIALIZE_GRABS: AtomicBool = AtomicBool::new(false);
 
-/// A decoded camera frame handed from the capture thread to the render loop.
+pub fn set_serialize_grabs(on: bool) {
+    SERIALIZE_GRABS.store(on, Ordering::Relaxed);
+}
+
+/// A camera frame handed from the capture thread to the render loop.
 struct CamFrame {
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
-    version: u64,
+    pixels: Pixels,
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pixels {
+    /// Already decoded on the CPU (MJPEG and anything else).
+    Rgba,
+    /// Raw YUYV 4:2:2, converted on the GPU by `YuyvPipeline`. Decoding it
+    /// on the CPU through nokhwa costs ~3 ms in release but ~160 ms in a
+    /// debug build (its converter is generic, so it's compiled unoptimized
+    /// inside this crate); copying it is just a memcpy either way.
+    Yuyv,
+}
+
+/// What the capture thread and the render loop share. Buffers circulate
+/// between the two instead of being allocated per frame: the capture
+/// thread decodes into a `spare`, publishes it as `ready`, and the render
+/// loop takes it, uploads it outside the lock and hands it back.
+#[derive(Default)]
+struct Shared {
+    /// The newest decoded frame the render loop hasn't uploaded yet.
+    ready: Option<CamFrame>,
+    spare: Vec<Vec<u8>>,
 }
 
 /// Owns a background thread that pulls frames from one camera device.
 pub struct CameraWorker {
-    frame: Arc<Mutex<Option<CamFrame>>>,
+    shared: Arc<Mutex<Shared>>,
+    /// The latest frame on the GPU, as RGBA.
+    gpu: Option<VideoTex>,
+    /// YUYV frames land here (half width, one texel per pixel pair) before
+    /// being converted into `gpu`.
+    packed: Option<VideoTex>,
     stop: Arc<AtomicBool>,
     /// False once the capture thread has exited (device unplugged, failed
     /// to open, ...).
@@ -49,94 +86,196 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 100;
 
 impl CameraWorker {
     pub fn spawn(index: CameraIndex) -> Self {
-        let frame = Arc::new(Mutex::new(None));
+        let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
 
-        let frame_handle = frame.clone();
+        let shared_handle = shared.clone();
         let stop_handle = stop.clone();
         let alive_handle = alive.clone();
         thread::spawn(move || {
             let _guard = AliveGuard(alive_handle);
+            let name = format!("cam {index}");
             let requested =
                 RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
             let mut camera = match Camera::new(index, requested) {
                 Ok(camera) => camera,
-                Err(_) => return,
+                Err(err) => {
+                    dlog!("{name}: open failed: {err}");
+                    return;
+                }
             };
-            if camera.open_stream().is_err() {
+            if let Err(err) = camera.open_stream() {
+                dlog!("{name}: open_stream failed: {err}");
                 return;
             }
+            dlog!("{name}: streaming {}", camera.camera_format());
 
-            let mut version = 0u64;
+            let mut stats = CaptureStats::new();
             let mut errors = 0u32;
+            let mut last_pixels = None;
             while !stop_handle.load(Ordering::Relaxed) {
-                let frame = {
+                let t0 = Instant::now();
+                let (frame, t_locked) = if SERIALIZE_GRABS.load(Ordering::Relaxed) {
                     let _guard = FRAME_LOCK.lock().unwrap();
-                    camera.frame()
+                    let t_locked = Instant::now();
+                    (camera.frame(), t_locked)
+                } else {
+                    (camera.frame(), t0)
                 };
+                let t_grabbed = Instant::now();
                 let Ok(buffer) = frame else {
                     errors += 1;
                     if errors >= MAX_CONSECUTIVE_ERRORS {
+                        dlog!("{name}: {errors} grab errors in a row, giving up");
                         break;
                     }
                     thread::sleep(Duration::from_millis(20));
                     continue;
                 };
                 errors = 0;
-                {
-                    if let Ok(decoded) = buffer.decode_image::<RgbAFormat>() {
-                        version += 1;
-                        let (width, height) = decoded.dimensions();
-                        *frame_handle.lock().unwrap() = Some(CamFrame {
-                            width,
-                            height,
-                            rgba: decoded.into_raw(),
-                            version,
+
+                let res = buffer.resolution();
+                let (width, height) = (res.width_x, res.height_y);
+                let raw = buffer.buffer();
+                let mut data = shared_handle.lock().unwrap().spare.pop().unwrap_or_default();
+                let is_yuyv = buffer.source_frame_format() == FrameFormat::YUYV
+                    && width % 2 == 0
+                    && raw.len() == (width * height * 2) as usize;
+                let frame = if is_yuyv {
+                    data.clear();
+                    data.extend_from_slice(raw);
+                    Some(CamFrame { width, height, pixels: Pixels::Yuyv, data })
+                } else {
+                    data.resize((width * height * 4) as usize, 0);
+                    match buffer.decode_image_to_buffer::<RgbAFormat>(&mut data) {
+                        Ok(()) => Some(CamFrame { width, height, pixels: Pixels::Rgba, data }),
+                        // Some streams report a resolution that doesn't match
+                        // the payload; fall back to the allocating decoder.
+                        Err(_) => buffer.decode_image::<RgbAFormat>().ok().map(|img| {
+                            let (width, height) = img.dimensions();
+                            CamFrame { width, height, pixels: Pixels::Rgba, data: img.into_raw() }
+                        }),
+                    }
+                };
+                let t_decoded = Instant::now();
+
+                if let Some(frame) = frame {
+                    if last_pixels != Some(frame.pixels) {
+                        last_pixels = Some(frame.pixels);
+                        dlog!("{name}: {:?} frames, {}", buffer.source_frame_format(), match frame.pixels {
+                            Pixels::Yuyv => "converted on the GPU",
+                            Pixels::Rgba => "decoded on the CPU",
                         });
                     }
+                    let mut shared = shared_handle.lock().unwrap();
+                    // Not uploaded yet: the render loop is behind, so this
+                    // frame is dropped and its buffer recycled.
+                    if let Some(old) = shared.ready.replace(frame) {
+                        shared.spare.push(old.data);
+                        stats.dropped += 1;
+                    }
                 }
+                stats.add(t_locked - t0, t_grabbed - t_locked, t_decoded - t_grabbed);
+                stats.report_every_second(&name);
             }
             let _ = camera.stop_stream();
+            dlog!("{name}: stopped");
         });
 
-        CameraWorker { frame, stop, alive }
+        CameraWorker { shared, gpu: None, packed: None, stop, alive }
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// Uploads the newest captured frame into `slot` if it's newer than
-    /// what's already there, and returns the texture. The upload copies
-    /// straight from the capture thread's buffer under its lock; nothing is
-    /// cloned.
+    /// Uploads the newest captured frame if one arrived since the last
+    /// call (YUYV gets its conversion pass recorded into `encoder`), and
+    /// returns the RGBA texture. The lock is only held to move the buffer
+    /// in and out; the copy to the GPU happens outside it, so the capture
+    /// thread never waits on the render loop.
     pub fn upload(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        slot: &mut Option<(VideoTex, u64)>,
+        encoder: &mut wgpu::CommandEncoder,
+        yuyv: &YuyvPipeline,
     ) -> Option<VideoTex> {
-        if let Some(f) = self.frame.lock().unwrap().as_ref() {
-            let fresh = !matches!(slot, Some((t, v)) if *v == f.version && (t.width, t.height) == (f.width, f.height));
-            if fresh && f.rgba.len() == (f.width * f.height * 4) as usize {
-                let reuse = matches!(slot, Some((t, _)) if (t.width, t.height) == (f.width, f.height));
-                if !reuse {
-                    let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
-                    *slot = Some((create_texture(device, f.width, f.height, usage), 0));
+        let ready = self.shared.lock().unwrap().ready.take();
+        if let Some(f) = ready {
+            use wgpu::TextureUsages as U;
+            let usage = U::TEXTURE_BINDING | U::COPY_DST | U::RENDER_ATTACHMENT | U::COPY_SRC;
+            match f.pixels {
+                Pixels::Rgba if f.data.len() == (f.width * f.height * 4) as usize => {
+                    let tex = ensure_texture(device, &mut self.gpu, f.width, f.height, usage);
+                    write_rgba(queue, &tex, &f.data);
                 }
-                let (tex, version) = slot.as_mut().unwrap();
-                write_rgba(queue, tex, &f.rgba);
-                *version = f.version;
+                Pixels::Yuyv => {
+                    let packed = ensure_texture(device, &mut self.packed, f.width / 2, f.height, U::TEXTURE_BINDING | U::COPY_DST);
+                    write_rgba(queue, &packed, &f.data);
+                    let tex = ensure_texture(device, &mut self.gpu, f.width, f.height, usage);
+                    yuyv.record(device, encoder, &packed, &tex);
+                }
+                Pixels::Rgba => {}
             }
+            self.shared.lock().unwrap().spare.push(f.data);
         }
-        slot.as_ref().map(|(t, _)| t.clone())
+        self.gpu.clone()
     }
 }
 
 impl Drop for CameraWorker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Per-second capture timings for the debug log.
+struct CaptureStats {
+    since: Instant,
+    frames: u32,
+    dropped: u32,
+    lock_wait: Duration,
+    grab: Duration,
+    decode: Duration,
+}
+
+impl CaptureStats {
+    fn new() -> Self {
+        CaptureStats {
+            since: Instant::now(),
+            frames: 0,
+            dropped: 0,
+            lock_wait: Duration::ZERO,
+            grab: Duration::ZERO,
+            decode: Duration::ZERO,
+        }
+    }
+
+    fn add(&mut self, lock_wait: Duration, grab: Duration, decode: Duration) {
+        self.frames += 1;
+        self.lock_wait += lock_wait;
+        self.grab += grab;
+        self.decode += decode;
+    }
+
+    fn report_every_second(&mut self, name: &str) {
+        let elapsed = self.since.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let n = self.frames.max(1) as f32;
+        let ms = |d: Duration| d.as_secs_f32() * 1000.0 / n;
+        dlog!(
+            "{name}: {:.1} fps | lock {:.1}ms grab {:.1}ms decode {:.1}ms | dropped {}",
+            self.frames as f32 / elapsed.as_secs_f32(),
+            ms(self.lock_wait),
+            ms(self.grab),
+            ms(self.decode),
+            self.dropped
+        );
+        *self = CaptureStats::new();
     }
 }
 
@@ -150,8 +289,6 @@ pub struct CameraState {
     pub wanted: Option<String>,
     pub worker: Option<CameraWorker>,
     pub dropdown_open: bool,
-    /// The latest frame on the GPU, and the capture version it came from.
-    pub gpu: Option<(VideoTex, u64)>,
 }
 
 impl CameraState {
@@ -162,7 +299,6 @@ impl CameraState {
             wanted: None,
             worker: None,
             dropdown_open: false,
-            gpu: None,
         }
     }
 
@@ -183,7 +319,6 @@ impl CameraState {
         self.wanted = choice.and_then(|i| available.get(i)).map(|c| c.human_name().to_string());
         self.worker = None;
         self.chrome.preview_texture = None;
-        self.gpu = None;
     }
 
     /// The camera list changed: find `wanted` in it again. The capture thread
@@ -198,7 +333,6 @@ impl CameraState {
         let after = self.selected.and_then(|i| new.get(i)).map(|c| c.index().clone());
         if before != after {
             self.worker = None;
-            self.gpu = None;
         }
     }
 }

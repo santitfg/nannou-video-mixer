@@ -12,6 +12,7 @@ use crate::gpu::VideoTex;
 use crate::Model;
 use nannou::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use wgpu_upstream as wgpu;
 
 /// Inputs before the module that reads them, each id once. Cycles are cut
@@ -54,6 +55,7 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("graph") });
     let mut results: HashMap<u64, VideoTex> = HashMap::new();
+    let mut upload_time = Duration::ZERO;
 
     for id in order {
         let Some(idx) = model.modules.iter().position(|m| m.id == id) else { continue };
@@ -95,7 +97,12 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
         };
 
         let produced = match &mut model.modules[idx].body {
-            ModuleBody::Camera(CameraState { worker: Some(worker), gpu, .. }) => worker.upload(device, queue, gpu),
+            ModuleBody::Camera(CameraState { worker: Some(worker), .. }) => {
+                let t = Instant::now();
+                let tex = worker.upload(device, queue, &mut encoder, &model.yuyv_pipeline);
+                upload_time += t.elapsed();
+                tex
+            }
             _ => produced,
         };
         if let Some(tex) = produced {
@@ -109,10 +116,12 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
     let output_id = model.output_id;
     for module in &mut model.modules {
         let chrome = module.body.chrome_mut();
+        let cached = chrome.preview_texture.take();
         chrome.preview_texture = if module.id == output_id || chrome.show_preview {
-            results.get(&module.id).map(|t| t.for_draw())
+            results.get(&module.id).map(|t| t.to_draw(cached))
         } else {
             None
         };
     }
+    model.timings.uploads += upload_time;
 }

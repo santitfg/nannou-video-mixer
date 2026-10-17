@@ -68,6 +68,22 @@ impl VideoTex {
         };
         nannou::wgpu::Texture::from_handle_and_descriptor(self.texture.clone(), descriptor)
     }
+
+    /// A drawable view of this texture, reusing `cached` when it already
+    /// points at the same texture so nothing is rebuilt per frame.
+    pub fn to_draw(&self, cached: Option<DrawTex>) -> DrawTex {
+        match cached {
+            Some(c) if Arc::ptr_eq(&c.source, &self.texture) => c,
+            _ => DrawTex { source: self.texture.clone(), view: self.for_draw().view().build() },
+        }
+    }
+}
+
+/// What the UI draws for a module: an sRGB view built once per texture.
+#[derive(Clone)]
+pub struct DrawTex {
+    source: Arc<wgpu::Texture>,
+    pub view: nannou::wgpu::TextureView,
 }
 
 pub fn create_texture(device: &wgpu::Device, width: u32, height: u32, usage: wgpu::TextureUsages) -> VideoTex {
@@ -87,15 +103,22 @@ pub fn create_texture(device: &wgpu::Device, width: u32, height: u32, usage: wgp
 /// A module's render target: reused frame to frame, recreated only when
 /// the resolution changes.
 pub fn ensure_target(device: &wgpu::Device, slot: &mut Option<VideoTex>, width: u32, height: u32) -> VideoTex {
+    let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+    ensure_texture(device, slot, width, height, usage)
+}
+
+/// The texture in `slot`, recreated only when the resolution changes.
+pub fn ensure_texture(
+    device: &wgpu::Device,
+    slot: &mut Option<VideoTex>,
+    width: u32,
+    height: u32,
+    usage: wgpu::TextureUsages,
+) -> VideoTex {
     if let Some(t) = slot.as_ref().filter(|t| (t.width, t.height) == (width, height)) {
         return t.clone();
     }
-    let t = create_texture(
-        device,
-        width,
-        height,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-    );
+    let t = create_texture(device, width, height, usage);
     *slot = Some(t.clone());
     t
 }
@@ -309,6 +332,101 @@ pub fn write_rgba(queue: &wgpu::Queue, tex: &VideoTex, rgba: &[u8]) {
     );
 }
 
+// --- YUYV -> RGBA ----------------------------------------------------------
+
+/// Camera YUYV (4:2:2) frames are uploaded as-is into a half-width RGBA
+/// texture — one texel per `Y0 U Y1 V` group — and converted here, instead
+/// of on the capture thread's CPU. Same integer BT.601 math as nokhwa's
+/// `yuyv444_to_rgb`, so colors match the CPU path.
+const YUYV_FS: &str = "
+@group(0) @binding(0) var src: texture_2d<f32>;
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let x = u32(pos.x);
+    let t = textureLoad(src, vec2<u32>(x / 2u, u32(pos.y)), 0) * 255.0;
+    let luma = select(t.r, t.b, (x & 1u) == 1u);
+    let c = (luma - 16.0) * 298.0;
+    let d = t.g - 128.0;
+    let e = t.a - 128.0;
+    let rgb = vec3<f32>(c + 409.0 * e, c - 100.0 * d - 208.0 * e, c + 516.0 * d) + 128.0;
+    return vec4<f32>(clamp(floor(rgb / 256.0), vec3<f32>(0.0), vec3<f32>(255.0)) / 255.0, 1.0);
+}
+";
+
+pub struct YuyvPipeline {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+impl YuyvPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("yuyv"),
+            source: wgpu::ShaderSource::Wgsl(format!("{POSITION_VS}{YUYV_FS}").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuyv-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("yuyv"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: "vs", buffers: &[] },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+        });
+        YuyvPipeline { pipeline, layout }
+    }
+
+    /// Records `target = rgba(src)`; `src` is the half-width packed texture.
+    pub fn record(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, src: &VideoTex, target: &VideoTex) {
+        let (view_src, view_t) = (src.view(), target.view());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view_src) }],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("yuyv"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view_t,
+                resolve_target: None,
+                ops: clear_pass_ops(),
+            })],
+            depth_stencil_attachment: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +456,27 @@ mod tests {
         let out = read_back(&device, &queue, &target);
         for px in out.chunks(4) {
             assert!((px[0] as i32 - 191).abs() <= 2 && (px[2] as i32 - 64).abs() <= 2, "{px:?}");
+        }
+    }
+
+    /// The GPU conversion must match nokhwa's CPU one byte for byte (±1).
+    #[test]
+    fn yuyv_converts_like_nokhwa() {
+        let Some((device, queue)) = device() else { return };
+        let (w, h) = (8u32, 4u32);
+        let yuyv: Vec<u8> = (0..w * h * 2).map(|i| (i * 37 % 256) as u8).collect();
+        let packed = upload(&device, &queue, w / 2, h, &yuyv);
+        let mut slot = None;
+        let target = ensure_target(&device, &mut slot, w, h);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        YuyvPipeline::new(&device).record(&device, &mut encoder, &packed, &target);
+        queue.submit(Some(encoder.finish()));
+
+        let mut expected = vec![0u8; (w * h * 4) as usize];
+        nokhwa::utils::buf_yuyv422_to_rgb(&yuyv, &mut expected, true).unwrap();
+        let out = read_back(&device, &queue, &target);
+        for (a, b) in out.iter().zip(&expected) {
+            assert!((*a as i32 - *b as i32).abs() <= 1, "gpu {a} vs cpu {b}");
         }
     }
 

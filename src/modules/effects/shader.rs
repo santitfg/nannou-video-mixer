@@ -251,14 +251,19 @@ pub fn compile_pending(device: &wgpu::Device, modules: &mut [PlacedModule], conn
                 s.needs_compile = false;
                 if let Some(file) = s.file.clone() {
                     s.mtime = std::fs::metadata(shader_path(&file)).ok().and_then(|md| md.modified().ok());
+                    let started = Instant::now();
                     match compile(device, &file) {
                         Ok(compiled) => {
+                            crate::dlog!("shader {file}: compiled in {:.1}ms", started.elapsed().as_secs_f32() * 1000.0);
                             s.compiled = Some(compiled);
                             s.error = None;
                             ports_changed = true;
                         }
                         // Keep running the last good version on a typo.
-                        Err(err) => s.error = Some(err),
+                        Err(err) => {
+                            crate::dlog!("shader {file}: {}", err.lines().next().unwrap_or(""));
+                            s.error = Some(err);
+                        }
                     }
                 }
             }
