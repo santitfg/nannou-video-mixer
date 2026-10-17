@@ -26,7 +26,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }}
+      # FFmpeg is built from source and linked statically (ffmpeg-next `build`).
+      - name: FFmpeg build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm libclang-dev
+      - name: FFmpeg build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: FFmpeg build tools (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          path-type: inherit
+          install: make nasm diffutils
+      - name: Build (Windows, inside MSYS2 for FFmpeg's configure)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build
+        if: runner.os != 'Windows'
+        run: cargo build --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: nannou_sketch-${{ matrix.target }}

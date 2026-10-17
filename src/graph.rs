@@ -7,6 +7,7 @@
 
 use crate::modules::effects::shader::compile_pending;
 use crate::modules::sources::camera::CameraState;
+use crate::modules::sources::video::VideoState;
 use crate::modules::{input_source, module_number, Connection, ModuleBody, PlacedModule};
 use crate::gpu::VideoTex;
 use crate::Model;
@@ -68,12 +69,12 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
         };
 
         let produced = match &model.modules[idx].body {
-            ModuleBody::Camera(_) => None, // handled below, needs &mut
+            ModuleBody::Camera(_) | ModuleBody::Video(_) => None, // handled below, needs &mut
             ModuleBody::Output(_) => video_in(&results, 0),
             ModuleBody::Blend(blend) => {
                 let a = video_in(&results, 0);
                 let b = video_in(&results, 1);
-                let mix = number_in(&model.modules, 2).unwrap_or(blend.mix);
+                let mix = blend.mix.resolve(number_in(&model.modules, 2));
                 let ModuleBody::Blend(blend) = &mut model.modules[idx].body else { unreachable!() };
                 blend.record(&model.blend_pipeline, device, queue, &mut encoder, a, b, mix)
             }
@@ -82,24 +83,33 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
                     None
                 } else {
                     let channels_n = shader.channels();
-                    let props: Vec<_> = shader.props().to_vec();
                     let channels: Vec<Option<VideoTex>> = (0..channels_n).map(|n| video_in(&results, n)).collect();
-                    let values: Vec<f32> = props
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| p.clamp(number_in(&model.modules, channels_n + i).unwrap_or(p.default)))
+                    let values: Vec<f32> = (0..shader.props().len())
+                        .map(|i| shader.prop_value(i, number_in(&model.modules, channels_n + i)))
                         .collect();
                     let ModuleBody::Shader(shader) = &mut model.modules[idx].body else { unreachable!() };
                     shader.record(device, queue, &mut encoder, &channels, values, now, delta)
                 }
             }
-            ModuleBody::Number(_) | ModuleBody::Mult(_) | ModuleBody::Lfo(_) => None,
+            ModuleBody::Number(_)
+            | ModuleBody::Mult(_)
+            | ModuleBody::Lfo(_)
+            | ModuleBody::Lag(_)
+            | ModuleBody::Map(_)
+            | ModuleBody::Clamp(_)
+            | ModuleBody::Wled(_) => None,
         };
 
         let produced = match &mut model.modules[idx].body {
             ModuleBody::Camera(CameraState { worker: Some(worker), .. }) => {
                 let t = Instant::now();
                 let tex = worker.upload(device, queue, &mut encoder, &model.yuyv_pipeline);
+                upload_time += t.elapsed();
+                tex
+            }
+            ModuleBody::Video(VideoState { worker: Some(worker), .. }) => {
+                let t = Instant::now();
+                let tex = worker.upload(device, queue, &mut encoder, &model.yuv420_pipeline);
                 upload_time += t.elapsed();
                 tex
             }

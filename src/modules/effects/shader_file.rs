@@ -14,16 +14,21 @@
 //! Every property becomes a global uniform of the same name in the shader
 //! and a Number input port on the module.
 
+use crate::modules::param::Param;
 use std::path::{Path, PathBuf};
 
 pub const SHADER_DIR: &str = "shaders";
 pub const MAX_CHANNELS: usize = 4;
+/// Where `iFeedback` (the module's previous frame) is bound.
+pub const FEEDBACK_BINDING: u32 = 3 + MAX_CHANNELS as u32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PropKind {
     Float,
     Range(f32, f32),
     Int,
+    /// One of `Property::options`, by index; an `int` in GLSL.
+    Enum(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +37,8 @@ pub struct Property {
     pub label: String,
     pub kind: PropKind,
     pub default: f32,
+    /// The choices of an `Enum` property (empty otherwise).
+    pub options: Vec<String>,
 }
 
 impl Property {
@@ -40,12 +47,33 @@ impl Property {
             PropKind::Float => v,
             PropKind::Range(lo, hi) => v.clamp(lo.min(hi), lo.max(hi)),
             PropKind::Int => v.round(),
+            PropKind::Enum(n) => v.round().clamp(0.0, n.saturating_sub(1) as f32),
         }
+    }
+
+    /// The option name for an `Enum` value.
+    pub fn option_name(&self, v: f32) -> Option<&str> {
+        match self.kind {
+            PropKind::Enum(_) => self.options.get(self.clamp(v) as usize).map(String::as_str),
+            _ => None,
+        }
+    }
+
+    /// The number box for this property: a `Range` keeps its bounds;
+    /// Float/Int get 0..1, widened when the default doesn't fit in it.
+    pub fn param(&self) -> Param {
+        let (min, max) = match self.kind {
+            PropKind::Range(lo, hi) => (lo, hi),
+            PropKind::Enum(n) => (0.0, n.saturating_sub(1) as f32),
+            _ if (0.0..=1.0).contains(&self.default) => (0.0, 1.0),
+            _ => (self.default.min(0.0), (2.0 * self.default).max(1.0)),
+        };
+        Param::ranged(self.default, min, max)
     }
 
     pub fn glsl_type(&self) -> &'static str {
         match self.kind {
-            PropKind::Int => "int",
+            PropKind::Int | PropKind::Enum(_) => "int",
             _ => "float",
         }
     }
@@ -56,6 +84,8 @@ pub struct ParsedShader {
     pub props: Vec<Property>,
     /// Highest `iChannelN` the code mentions, plus one (0 = none used).
     pub channels: usize,
+    /// The code reads `iFeedback` (this module's own previous frame).
+    pub feedback: bool,
     /// The source with the Properties block blanked out (newlines kept so
     /// line numbers stay meaningful).
     pub body: String,
@@ -92,7 +122,8 @@ pub fn parse_shader(source: &str) -> Result<ParsedShader, String> {
         .find(|n| body.contains(&format!("iChannel{n}")))
         .map(|n| n + 1)
         .unwrap_or(0);
-    Ok(ParsedShader { props, channels, body })
+    let feedback = body.contains("iFeedback");
+    Ok(ParsedShader { props, channels, feedback, body })
 }
 
 fn extract_properties(source: &str) -> Result<(Vec<Property>, String), String> {
@@ -141,7 +172,7 @@ fn extract_properties(source: &str) -> Result<(Vec<Property>, String), String> {
     Ok((props, body))
 }
 
-/// `_Name ("Label", Float|Int|Range(lo, hi)) = default`
+/// `_Name ("Label", Float|Int|Range(lo, hi)|Enum(A, B, ...)) = default`
 fn parse_property(line: &str) -> Result<Property, String> {
     let paren = line.find('(').ok_or("expected '(' after the name")?;
     let name = line[..paren].trim().to_string();
@@ -181,6 +212,7 @@ fn parse_property(line: &str) -> Result<Property, String> {
         .trim();
 
     let lower = type_str.to_ascii_lowercase();
+    let mut options = Vec::new();
     let kind = if lower == "float" {
         PropKind::Float
     } else if lower == "int" {
@@ -191,8 +223,19 @@ fn parse_property(line: &str) -> Result<Property, String> {
         let lo: f32 = lo.trim().parse().map_err(|_| "bad Range min")?;
         let hi: f32 = hi.trim().parse().map_err(|_| "bad Range max")?;
         PropKind::Range(lo, hi)
+    } else if lower.starts_with("enum") {
+        let args = type_str[4..]
+            .trim()
+            .strip_prefix('(')
+            .and_then(|a| a.strip_suffix(')'))
+            .ok_or("Enum needs (A, B, ...)")?;
+        options = args.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+        if options.is_empty() {
+            return Err("Enum needs at least one option".into());
+        }
+        PropKind::Enum(options.len())
     } else {
-        return Err(format!("unknown type '{type_str}' (use Float, Int or Range(min, max))"));
+        return Err(format!("unknown type '{type_str}' (use Float, Int, Range(min, max) or Enum(A, B, ...))"));
     };
 
     let rest = line[end + 1..].trim();
@@ -206,7 +249,7 @@ fn parse_property(line: &str) -> Result<Property, String> {
         None => 0.0,
     };
 
-    let mut prop = Property { name, label, kind, default };
+    let mut prop = Property { name, label, kind, default, options };
     prop.default = prop.clamp(prop.default);
     Ok(prop)
 }
@@ -245,6 +288,10 @@ pub fn build_glsl(parsed: &ParsedShader) -> (String, usize) {
             3 + n
         ));
     }
+    s.push_str(&format!(
+        "layout(set = 0, binding = {}) uniform texture2D iFeedbackTex;\n#define iFeedback sampler2D(iFeedbackTex, iSamp)\n",
+        FEEDBACK_BINDING
+    ));
     s.push_str("#define iResolution iResolution4.xyz\n#define iChannelResolution iChannelRes4\n");
     // Textures are stored top row first but Shadertoy's v runs bottom-up,
     // so flip v on every sampling call.
@@ -287,6 +334,21 @@ mod tests {
         assert_eq!(parsed.channels, 2);
         assert!(!parsed.body.contains("Properties"));
         assert_eq!(parsed.body.matches('\n').count(), src.matches('\n').count());
+    }
+
+    #[test]
+    fn parses_enum_properties() {
+        let src = "Properties {\n _Mode (\"Mode\", Enum(Classic, Additive, Water)) = 1\n}\nvoid mainImage(out vec4 f, in vec2 p){ f = texture(iFeedback, p); }";
+        let parsed = parse_shader(src).unwrap();
+        let p = &parsed.props[0];
+        assert_eq!(p.kind, PropKind::Enum(3));
+        assert_eq!(p.options, ["Classic", "Additive", "Water"]);
+        assert_eq!(p.default, 1.0);
+        assert_eq!(p.option_name(2.4), Some("Water"));
+        assert_eq!((p.param().min, p.param().max), (0.0, 2.0));
+        assert_eq!(p.glsl_type(), "int");
+        assert!(parsed.feedback);
+        assert!(parse_shader("Properties { _M (\"m\", Enum()) = 0 }").is_err());
     }
 
     #[test]

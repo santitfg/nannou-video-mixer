@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::client::WledClient;
-use crate::discovery::DeviceDiscovery;
+use crate::discovery::{DeviceDiscovery, DiscoveredDevice};
 use crate::poller::{DevicePoller, DeviceReading};
 
 struct TrackedDevice {
@@ -42,6 +42,17 @@ impl WledManager {
     /// when mDNS discovery is unreliable or unavailable.
     pub fn add_manual(&self, addr: SocketAddr) {
         self.track(addr, addr.to_string(), None);
+    }
+
+    /// Tracks a device found by a discovery run elsewhere (e.g. on a
+    /// background thread, so the caller's thread never blocks on mDNS).
+    pub fn add_discovered(&self, found: DiscoveredDevice) {
+        self.track(found.addr, found.name, found.mac);
+    }
+
+    /// The current poll interval.
+    pub fn poll_interval(&self) -> Duration {
+        *self.poll_interval.lock().unwrap()
     }
 
     fn track(&self, addr: SocketAddr, name: String, mac: Option<String>) {

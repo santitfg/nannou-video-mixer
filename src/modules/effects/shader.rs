@@ -1,9 +1,11 @@
 use super::shader_file::{
-    build_glsl, parse_shader, props_size, shader_path, ParsedShader, PropKind, Property, GLOBALS_SIZE,
-    MAX_CHANNELS,
+    build_glsl, parse_shader, props_size, shader_path, ParsedShader, PropKind, Property, FEEDBACK_BINDING,
+    GLOBALS_SIZE, MAX_CHANNELS,
 };
 use crate::gpu::{clear_pass_ops, create_texture, ensure_target, uniform_buffer, VideoTex, FORMAT, POSITION_VS};
+use crate::modules::param::Param;
 use crate::modules::{Connection, ModuleBody, PlacedModule, PortType};
+use std::collections::BTreeMap;
 use crate::ModuleChrome;
 use std::borrow::Cow;
 use std::time::{Duration, Instant, SystemTime};
@@ -20,8 +22,15 @@ pub struct ShaderState {
     /// File name inside the shaders folder.
     pub file: Option<String>,
     pub dropdown_open: bool,
+    /// The `Enum` property whose options dropdown is open.
+    pub prop_dropdown: Option<usize>,
     pub compiled: Option<Compiled>,
     pub error: Option<String>,
+    /// One number box per property, in `props` order.
+    pub params: Vec<Param>,
+    /// Boxes by property name, kept across recompiles (and filled from a
+    /// saved composition) so tuning survives editing the file.
+    pub tuned: BTreeMap<String, Param>,
     /// The values the properties had on the last rendered frame.
     pub live: Vec<f32>,
     needs_compile: bool,
@@ -36,8 +45,11 @@ impl ShaderState {
             chrome: ModuleChrome::new(),
             file: None,
             dropdown_open: false,
+            prop_dropdown: None,
             compiled: None,
             error: None,
+            params: Vec::new(),
+            tuned: BTreeMap::new(),
             live: Vec::new(),
             needs_compile: false,
             mtime: None,
@@ -51,6 +63,9 @@ impl ShaderState {
         self.file = file;
         self.compiled = None;
         self.error = None;
+        self.prop_dropdown = None;
+        self.params.clear();
+        self.tuned.clear();
         self.live.clear();
         self.mtime = None;
     }
@@ -69,19 +84,34 @@ impl ShaderState {
         types
     }
 
-    /// One short label per input port, with the live value for properties.
-    pub fn port_labels(&self) -> Vec<String> {
-        let mut labels: Vec<String> = (0..self.channels()).map(|n| format!("iChannel{n}")).collect();
-        for (i, p) in self.props().iter().enumerate() {
-            let value = self.live.get(i).copied().unwrap_or(p.default);
-            labels.push(format!("{} {:.2}", p.label, value));
+    /// The value property `i` renders with: its box's own value, or the
+    /// wired signal mapped onto the box's range. Int properties round.
+    pub fn prop_value(&self, i: usize, input: Option<f32>) -> f32 {
+        let Some(param) = self.params.get(i) else { return 0.0 };
+        let v = param.resolve(input);
+        match self.props().get(i) {
+            Some(p) if matches!(p.kind, PropKind::Int | PropKind::Enum(_)) => p.clamp(v),
+            _ => v,
         }
-        labels
+    }
+
+    /// Writes property `i`'s box back into `tuned`, after it was edited.
+    pub fn remember(&mut self, i: usize) {
+        if let (Some(prop), Some(param)) = (self.props().get(i), self.params.get(i)) {
+            self.tuned.insert(prop.name.clone(), *param);
+        }
+    }
+
+    /// Rebuilds `params` for freshly compiled props, reusing tuned boxes.
+    fn rebuild_params(&mut self) {
+        let props = self.props().to_vec();
+        self.params = props.iter().map(|p| self.tuned.get(&p.name).copied().unwrap_or_else(|| p.param())).collect();
     }
 }
 
 pub struct Compiled {
     pub channels: usize,
+    pub feedback: bool,
     pub props: Vec<Property>,
     gpu: Gpu,
 }
@@ -94,7 +124,10 @@ struct Gpu {
     props: wgpu::Buffer,
     /// Bound in place of any channel with nothing plugged in.
     placeholder: VideoTex,
-    target: Option<VideoTex>,
+    /// Render targets. Shaders reading `iFeedback` alternate between the
+    /// two, sampling last frame's while drawing into the other.
+    targets: [Option<VideoTex>; 2],
+    current: usize,
 }
 
 // --- Compilation ---------------------------------------------------------
@@ -160,9 +193,9 @@ fn compile_from_source(device: &wgpu::Device, source: &str) -> Result<Compiled, 
             count: None,
         },
     ];
-    for n in 0..MAX_CHANNELS as u32 {
+    for binding in (3..3 + MAX_CHANNELS as u32).chain([FEEDBACK_BINDING]) {
         entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 3 + n,
+            binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Texture {
                 sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -214,6 +247,7 @@ fn compile_from_source(device: &wgpu::Device, source: &str) -> Result<Compiled, 
 
     Ok(Compiled {
         channels: parsed.channels,
+        feedback: parsed.feedback,
         gpu: Gpu {
             pipeline,
             layout,
@@ -221,7 +255,8 @@ fn compile_from_source(device: &wgpu::Device, source: &str) -> Result<Compiled, 
             globals: uniform_buffer(device, GLOBALS_SIZE),
             props: uniform_buffer(device, props_size(&parsed.props)),
             placeholder,
-            target: None,
+            targets: [None, None],
+            current: 0,
         },
         props: parsed.props,
     })
@@ -257,6 +292,7 @@ pub fn compile_pending(device: &wgpu::Device, modules: &mut [PlacedModule], conn
                             crate::dlog!("shader {file}: compiled in {:.1}ms", started.elapsed().as_secs_f32() * 1000.0);
                             s.compiled = Some(compiled);
                             s.error = None;
+                            s.rebuild_params();
                             ports_changed = true;
                         }
                         // Keep running the last good version on a typo.
@@ -306,7 +342,20 @@ impl ShaderState {
             .map(|t| (t.width, t.height))
             .next()
             .unwrap_or(DEFAULT_SIZE);
-        let target = ensure_target(device, &mut compiled.gpu.target, width, height);
+        let gpu = &mut compiled.gpu;
+        // Feedback shaders draw into the other target each frame; a size
+        // change restarts both (black) so they never disagree.
+        let previous = if compiled.feedback {
+            let prev = gpu.targets[gpu.current].clone().filter(|t| (t.width, t.height) == (width, height));
+            if prev.is_none() {
+                gpu.targets = [None, None];
+            }
+            gpu.current = 1 - gpu.current;
+            prev
+        } else {
+            None
+        };
+        let target = ensure_target(device, &mut gpu.targets[gpu.current], width, height);
 
         // Uniforms. Layout mirrors the blocks in `build_glsl` (std140).
         let push_f = |buf: &mut Vec<u8>, v: f32| buf.extend_from_slice(&v.to_ne_bytes());
@@ -336,7 +385,7 @@ impl ShaderState {
         for (i, (prop, value)) in compiled.props.iter().zip(&values).enumerate() {
             let at = 16 + i * 4;
             let bytes = match prop.kind {
-                PropKind::Int => (*value as i32).to_ne_bytes(),
+                PropKind::Int | PropKind::Enum(_) => (*value as i32).to_ne_bytes(),
                 _ => value.to_ne_bytes(),
             };
             props[at..at + 4].copy_from_slice(&bytes);
@@ -362,6 +411,11 @@ impl ShaderState {
                 resource: wgpu::BindingResource::TextureView(view),
             });
         }
+        let feedback_view = previous.as_ref().unwrap_or(&gpu.placeholder).view();
+        entries.push(wgpu::BindGroupEntry {
+            binding: FEEDBACK_BINDING,
+            resource: wgpu::BindingResource::TextureView(&feedback_view),
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &gpu.layout,
@@ -464,6 +518,24 @@ mod tests {
         for (a, b) in out.chunks(4).zip(rgba.chunks(4)) {
             assert!((a[0] as i32 - b[0] as i32).abs() <= 2 && (a[1] as i32 - b[1] as i32).abs() <= 2, "{a:?} vs {b:?}");
         }
+    }
+
+    /// A shader adding its own previous frame keeps getting brighter,
+    /// which only happens if the two feedback targets really alternate.
+    #[test]
+    fn feedback_reads_previous_frame() {
+        let Some((device, queue)) = gpu() else { return };
+        let src = "void mainImage(out vec4 c, in vec2 p) { c = vec4(texture(iFeedback, p / iResolution.xy).rgb + 0.1, 1.0); }";
+        let mut state = ShaderState::new();
+        state.compiled = Some(compile_from_source(&device, src).unwrap());
+        let mut reds = Vec::new();
+        for _ in 0..3 {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            let out = state.record(&device, &queue, &mut encoder, &[], vec![], 0.0, 0.016).unwrap();
+            queue.submit(Some(encoder.finish()));
+            reds.push(crate::gpu::read_back(&device, &queue, &out)[0]);
+        }
+        assert!(reds[0] < reds[1] && reds[1] < reds[2], "{reds:?}");
     }
 
     #[test]

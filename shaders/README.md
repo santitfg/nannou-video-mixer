@@ -24,16 +24,45 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 ```
 
 * Each property becomes a global uniform with that exact name **and** a
-  Number input port on the module (labelled, with its live value). Plug a
-  Number / LFO / Mult in to drive it; unplugged, it uses the default.
+  number box on the module, next to its input port. Drag the box, click it
+  to type a value, or right-click it to change its range / clamping. Plug a
+  Number / LFO / Lag / Mult in to drive it: the cable's 0..1 is mapped onto
+  the box's range.
 * `iChannel0..3` become Video input ports — only as many as the code
   mentions. The output resolution follows the first connected channel
   (640x360 when there are none).
+* `iFeedback` is this module's own previous frame (black on the first
+  frame or after a resolution change). Sample it like a channel:
+  `texture(iFeedback, uv)`. See `feedback.glsl`.
 * Available uniforms: `iResolution`, `iTime`, `iTimeDelta`, `iFrame`,
-  `iFrameRate`, `iChannelResolution[]`, `iChannel0..3`. `iMouse` and
-  `iDate` exist but are always zero.
-* Types: `Float`, `Int`, `Range(min, max)`. No vectors/colors yet.
+  `iFrameRate`, `iChannelResolution[]`, `iChannel0..3`, `iFeedback`.
+  `iMouse` and `iDate` exist but are always zero.
+* Types: `Float`, `Int`, `Range(min, max)` and `Enum(A, B, ...)`. An Enum
+  is an `int` in GLSL (0 = first option) and shows up as a dropdown of its
+  options (a wired cable's 0..1 steps through them). No vectors/colors yet.
+* `iChannelResolution[n].x` is 0 for an unplugged channel — handy to ignore
+  it (see `mixer.glsl`).
 
-Notes: `texture(iChannelN, uv)` works, but `iChannelN` can't be passed to a
-function as a `sampler2D` parameter. Only the output (or a module with its
-preview on) is rendered, so shaders that aren't wired to anything cost nothing.
+```glsl
+_Mode ("Mode", Enum(Classic, Additive, Water)) = 0
+...
+if (_Mode == 1) { ... }
+```
+
+## Favorites
+
+In a Shader module's file dropdown, click the star at the end of a row to
+pin that shader. Pinned shaders appear in the sidebar under **Effects** and
+create a Shader with that file already loaded. Right-click one in the
+sidebar (or click its star again) to unpin it.
+
+## Limitations
+
+* `iChannelN` / `iFeedback` can't be passed to a function as a
+  `sampler2D` parameter: sample inside `mainImage` (helpers can take the
+  sampled colors or coordinates instead).
+* No early `return` inside `mainImage`: assign `fragColor` once at the end
+  (use `step()`/`if` blocks to pick the value).
+
+Only the output (or a module with its preview on) is rendered, so shaders
+that aren't wired to anything cost nothing.

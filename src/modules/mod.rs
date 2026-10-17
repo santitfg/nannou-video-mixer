@@ -2,16 +2,25 @@ pub mod effects;
 pub mod math;
 pub mod mix;
 pub mod output;
+pub mod param;
 pub mod sources;
 
 use crate::ModuleChrome;
 use effects::shader::ShaderState;
-use math::{lfo::LfoState, mult::MultState, number::NumberState};
+use math::{
+    lag::LagState,
+    lfo::LfoState,
+    map::{ClampState, MapState},
+    mult::MultState,
+    number::NumberState,
+};
 use mix::blend::BlendState;
 use nannou::prelude::*;
 use output::OutputState;
 use serde::{Deserialize, Serialize};
 use sources::camera::CameraState;
+use sources::video::VideoState;
+use sources::wled::WledState;
 
 // --- Module kinds ------------------------------------------------------
 //
@@ -26,16 +35,21 @@ use sources::camera::CameraState;
 #[serde(rename_all = "lowercase")]
 pub enum ModuleKind {
     Camera,
+    Video,
     Blend,
     Output,
     Number,
     Mult,
     Lfo,
+    Lag,
+    Map,
+    Clamp,
+    Wled,
     Shader,
 }
 
 pub const CATEGORIES: &[(&str, &[(&str, ModuleKind)])] = &[
-    ("Sources", &[("Camera", ModuleKind::Camera)]),
+    ("Sources", &[("Camera", ModuleKind::Camera), ("Video", ModuleKind::Video), ("WLED", ModuleKind::Wled)]),
     ("Mix", &[("Blend", ModuleKind::Blend)]),
     (
         "Math",
@@ -43,35 +57,35 @@ pub const CATEGORIES: &[(&str, &[(&str, ModuleKind)])] = &[
             ("Number", ModuleKind::Number),
             ("Mult", ModuleKind::Mult),
             ("LFO", ModuleKind::Lfo),
+            ("Lag", ModuleKind::Lag),
+            ("Map", ModuleKind::Map),
+            ("Clamp", ModuleKind::Clamp),
         ],
     ),
     ("Effects", &[("Shader", ModuleKind::Shader)]),
 ];
 
-/// The two kinds of signal a port can carry. Colors are how a port/cable's
-/// kind is shown — video ports/cables are yellow, number ones black —
-/// independent of whatever color a module's body happens to be.
+/// The two kinds of signal a port can carry. Each palette gives them their
+/// own color (see `ui::Theme::port`), independent of module body colors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortType {
     Video,
     Number,
 }
 
-pub fn port_color(port_type: PortType) -> Srgb<u8> {
-    match port_type {
-        PortType::Video => YELLOW,
-        PortType::Number => BLACK,
-    }
-}
-
 pub fn kind_label(kind: ModuleKind) -> &'static str {
     match kind {
         ModuleKind::Camera => "Camera",
+        ModuleKind::Video => "Video",
         ModuleKind::Blend => "Blend",
         ModuleKind::Output => "Output",
         ModuleKind::Number => "Number",
         ModuleKind::Mult => "Mult",
         ModuleKind::Lfo => "LFO",
+        ModuleKind::Lag => "Lag",
+        ModuleKind::Map => "Map",
+        ModuleKind::Clamp => "Clamp",
+        ModuleKind::Wled => "WLED",
         ModuleKind::Shader => "Shader",
     }
 }
@@ -85,15 +99,25 @@ pub fn input_types(kind: ModuleKind) -> &'static [PortType] {
         ModuleKind::Blend => &[PortType::Video, PortType::Video, PortType::Number],
         ModuleKind::Output => &[PortType::Video],
         ModuleKind::Mult => &[PortType::Number, PortType::Number],
+        ModuleKind::Lag | ModuleKind::Map | ModuleKind::Clamp => &[PortType::Number],
+        ModuleKind::Wled => &[],
+        // Speed, then scrub (a wired scrub drives the playhead directly).
+        ModuleKind::Video => &[PortType::Number, PortType::Number],
     }
 }
 
 /// The type of a module's single output port, or `None` if it has no output.
 pub fn output_type(kind: ModuleKind) -> Option<PortType> {
     match kind {
-        ModuleKind::Camera | ModuleKind::Blend | ModuleKind::Shader => Some(PortType::Video),
+        ModuleKind::Camera | ModuleKind::Video | ModuleKind::Blend | ModuleKind::Shader => Some(PortType::Video),
         ModuleKind::Output => None,
-        ModuleKind::Number | ModuleKind::Mult | ModuleKind::Lfo => Some(PortType::Number),
+        ModuleKind::Number
+        | ModuleKind::Mult
+        | ModuleKind::Lfo
+        | ModuleKind::Lag
+        | ModuleKind::Map
+        | ModuleKind::Clamp
+        | ModuleKind::Wled => Some(PortType::Number),
     }
 }
 
@@ -111,9 +135,14 @@ pub fn has_video_preview(kind: ModuleKind) -> bool {
 pub fn has_config_row(kind: ModuleKind) -> bool {
     match kind {
         ModuleKind::Camera
+        | ModuleKind::Video
         | ModuleKind::Blend
         | ModuleKind::Number
         | ModuleKind::Lfo
+        | ModuleKind::Lag
+        | ModuleKind::Map
+        | ModuleKind::Clamp
+        | ModuleKind::Wled
         | ModuleKind::Mult
         | ModuleKind::Shader => true,
         ModuleKind::Output => false,
@@ -125,20 +154,18 @@ pub fn is_deletable(kind: ModuleKind) -> bool {
 }
 
 pub fn base_height(kind: ModuleKind) -> f32 {
-    if has_config_row(kind) {
-        90.0
-    } else {
-        64.0
-    }
-}
-
-pub fn body_color(kind: ModuleKind) -> Srgb<u8> {
     match kind {
-        ModuleKind::Camera => STEELBLUE,
-        ModuleKind::Blend => rgb8(130, 90, 160),
-        ModuleKind::Shader => rgb8(70, 130, 100),
-        ModuleKind::Output => DARKSLATEGRAY,
-        ModuleKind::Number | ModuleKind::Mult | ModuleKind::Lfo => rgb8(180, 130, 60),
+        // A second row with a mode selector (LFO wave, blend mode, lag curve).
+        ModuleKind::Lfo | ModuleKind::Blend | ModuleKind::Lag => 126.0,
+        // File, speed, transport and the scrub bar.
+        ModuleKind::Video => 180.0,
+        // Two rows of range fields, then the clamp toggle and readout.
+        ModuleKind::Map => 126.0,
+        ModuleKind::Clamp => 126.0,
+        // Grows with its inputs: see `PlacedModule::base_height`.
+        ModuleKind::Wled => WLED_ROWS_TOP + 40.0,
+        _ if has_config_row(kind) => 90.0,
+        _ => 64.0,
     }
 }
 
@@ -162,11 +189,16 @@ pub fn title_buttons_for(kind: ModuleKind) -> &'static [TitleButton] {
 
 pub enum ModuleBody {
     Camera(CameraState),
+    Video(VideoState),
     Blend(BlendState),
     Output(OutputState),
     Number(NumberState),
     Mult(MultState),
     Lfo(LfoState),
+    Lag(LagState),
+    Map(MapState),
+    Clamp(ClampState),
+    Wled(WledState),
     Shader(ShaderState),
 }
 
@@ -174,11 +206,16 @@ impl ModuleBody {
     pub fn chrome(&self) -> &ModuleChrome {
         match self {
             ModuleBody::Camera(s) => &s.chrome,
+            ModuleBody::Video(s) => &s.chrome,
             ModuleBody::Blend(s) => &s.chrome,
             ModuleBody::Output(s) => &s.chrome,
             ModuleBody::Number(s) => &s.chrome,
             ModuleBody::Mult(s) => &s.chrome,
             ModuleBody::Lfo(s) => &s.chrome,
+            ModuleBody::Lag(s) => &s.chrome,
+            ModuleBody::Map(s) => &s.chrome,
+            ModuleBody::Clamp(s) => &s.chrome,
+            ModuleBody::Wled(s) => &s.chrome,
             ModuleBody::Shader(s) => &s.chrome,
         }
     }
@@ -186,11 +223,16 @@ impl ModuleBody {
     pub fn chrome_mut(&mut self) -> &mut ModuleChrome {
         match self {
             ModuleBody::Camera(s) => &mut s.chrome,
+            ModuleBody::Video(s) => &mut s.chrome,
             ModuleBody::Blend(s) => &mut s.chrome,
             ModuleBody::Output(s) => &mut s.chrome,
             ModuleBody::Number(s) => &mut s.chrome,
             ModuleBody::Mult(s) => &mut s.chrome,
             ModuleBody::Lfo(s) => &mut s.chrome,
+            ModuleBody::Lag(s) => &mut s.chrome,
+            ModuleBody::Map(s) => &mut s.chrome,
+            ModuleBody::Clamp(s) => &mut s.chrome,
+            ModuleBody::Wled(s) => &mut s.chrome,
             ModuleBody::Shader(s) => &mut s.chrome,
         }
     }
@@ -207,6 +249,9 @@ pub struct PlacedModule {
 pub const SHADER_PORT_STEP: f32 = 24.0;
 /// Where a Shader's first port sits, measured down from the top of the box.
 pub const SHADER_PORT_TOP: f32 = 84.0;
+/// Where a WLED module's input rows start, and how tall each is.
+pub const WLED_ROWS_TOP: f32 = 96.0;
+pub const WLED_ROW_H: f32 = 26.0;
 
 impl PlacedModule {
     /// The type of each input port, in order. Fixed per kind, except Shader,
@@ -224,6 +269,7 @@ impl PlacedModule {
                 let ports = s.input_types().len() as f32;
                 (SHADER_PORT_TOP + ports * SHADER_PORT_STEP + 4.0).max(base_height(self.kind))
             }
+            ModuleBody::Wled(w) => WLED_ROWS_TOP + w.inputs.len().max(1) as f32 * WLED_ROW_H + 40.0,
             _ => base_height(self.kind),
         }
     }
@@ -240,11 +286,16 @@ pub struct Connection {
 pub fn push_module(modules: &mut Vec<PlacedModule>, next_id: &mut u64, kind: ModuleKind, pos: Point2) -> u64 {
     let body = match kind {
         ModuleKind::Camera => ModuleBody::Camera(CameraState::new()),
+        ModuleKind::Video => ModuleBody::Video(VideoState::new()),
         ModuleKind::Blend => ModuleBody::Blend(BlendState::new()),
         ModuleKind::Output => ModuleBody::Output(OutputState::new()),
         ModuleKind::Number => ModuleBody::Number(NumberState::new()),
         ModuleKind::Mult => ModuleBody::Mult(MultState::new()),
         ModuleKind::Lfo => ModuleBody::Lfo(LfoState::new()),
+        ModuleKind::Lag => ModuleBody::Lag(LagState::new()),
+        ModuleKind::Map => ModuleBody::Map(MapState::new()),
+        ModuleKind::Clamp => ModuleBody::Clamp(ClampState::new()),
+        ModuleKind::Wled => ModuleBody::Wled(WledState::new()),
         ModuleKind::Shader => ModuleBody::Shader(ShaderState::new()),
     };
     let id = *next_id;
@@ -260,9 +311,10 @@ pub(crate) fn input_source(connections: &[Connection], to: u64, to_input: usize)
         .map(|c| c.from)
 }
 
-/// Computes the current number a module's output carries: Number returns
-/// its own value, LFO its current oscillation, Mult the product of its
-/// two inputs (or whichever one is connected, if only one is). Math is
+/// Computes the current number a module's output carries (normalized,
+/// 0..1 by convention): Number where its value sits in its range, LFO its
+/// current oscillation, Mult the product of its two inputs (or whichever
+/// one is connected, if only one is). Math is
 /// cheap enough that, unlike video frames, this is just recomputed fresh
 /// every time it's needed rather than cached.
 pub fn module_number(
@@ -278,11 +330,18 @@ pub fn module_number(
     visiting.push(id);
 
     let result = modules.iter().find(|m| m.id == id).and_then(|m| match &m.body {
-        ModuleBody::Number(number) => Some(number.value),
-        ModuleBody::Lfo(lfo) => {
-            let phase = 2.0 * std::f32::consts::PI * lfo.freq * now;
-            Some((phase.sin() + 1.0) / 2.0)
-        }
+        ModuleBody::Number(number) => Some(number.value.output_norm()),
+        ModuleBody::Lfo(lfo) => Some(lfo.sample(now, id)),
+        // Advanced once per tick in `update` (it has state).
+        ModuleBody::Lag(lag) => lag.output(),
+        ModuleBody::Map(map) => input_source(connections, id, 0)
+            .and_then(|src| module_number(modules, connections, src, now, visiting))
+            .map(|x| map.apply(x)),
+        ModuleBody::Clamp(clamp) => input_source(connections, id, 0)
+            .and_then(|src| module_number(modules, connections, src, now, visiting))
+            .map(|x| clamp.apply(x)),
+        // Refreshed from the device every tick in `update`.
+        ModuleBody::Wled(wled) => wled.output(),
         ModuleBody::Mult(_) => {
             let a = input_source(connections, id, 0)
                 .and_then(|src| module_number(modules, connections, src, now, visiting));
@@ -294,7 +353,9 @@ pub fn module_number(
                 (None, None) => None,
             }
         }
-        ModuleBody::Camera(_) | ModuleBody::Blend(_) | ModuleBody::Output(_) | ModuleBody::Shader(_) => None,
+        ModuleBody::Camera(_) | ModuleBody::Video(_) | ModuleBody::Blend(_) | ModuleBody::Output(_) | ModuleBody::Shader(_) => {
+            None
+        }
     });
 
     visiting.pop();

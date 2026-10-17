@@ -1,3 +1,4 @@
+use crate::ui::Palette;
 use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_PATH: &str = "settings.json";
@@ -13,6 +14,16 @@ pub struct Settings {
     pub drag_speed: f32,
     /// Frame-rate readout in the top-left corner.
     pub show_fps: bool,
+    /// Show an Exit button (and the cursor) when the mouse moves in
+    /// fullscreen. Off: fullscreen stays clean; leave with a click or key.
+    pub show_exit_button: bool,
+    pub palette: Palette,
+    /// Shader files pinned to the sidebar (Effects), in pin order.
+    pub favorite_shaders: Vec<String>,
+    /// WLED controllers to reconnect to on start (found by a scan or added by IP).
+    pub wled_devices: Vec<WledDevice>,
+    /// How often each WLED controller is polled.
+    pub wled_poll_ms: u64,
     /// On-screen debug log (Settings → Debug).
     pub debug_log: bool,
     /// Take a global lock around every camera frame grab (Settings → Debug);
@@ -20,7 +31,16 @@ pub struct Settings {
     pub serialize_camera_grabs: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WledDevice {
+    /// "192.168.1.50:80"
+    pub addr: String,
+    pub name: String,
+}
+
 impl Settings {
+    /// The WLED panel's poll-rate choices.
+    pub const WLED_POLL_CHOICES: [u64; 5] = [20, 50, 100, 250, 500];
     pub const SPEED_MIN: f32 = 0.05;
     pub const SPEED_MAX: f32 = 2.0;
 }
@@ -31,6 +51,11 @@ impl Default for Settings {
             scroll_speed: 0.3,
             drag_speed: 1.0,
             show_fps: false,
+            show_exit_button: false,
+            palette: Palette::Dark,
+            favorite_shaders: Vec::new(),
+            wled_devices: Vec::new(),
+            wled_poll_ms: 50,
             debug_log: false,
             serialize_camera_grabs: false,
         }
