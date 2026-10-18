@@ -29,7 +29,7 @@ use nannou::prelude::*;
 use nannou::winit::window::CursorIcon;
 use nokhwa::utils::CameraInfo;
 use group::{Group, GroupButton};
-use save::{load_composition, save_composition, Preset, Snippet};
+use save::{load_composition, save_composition, save_composition_to, Preset, Snippet};
 use settings::Settings;
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -39,6 +39,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
 const SAVE_STATUS_TIMEOUT: Duration = Duration::from_millis(2500);
 const ZOOM_INDICATOR_TIMEOUT: Duration = Duration::from_millis(1200);
 pub const SAVE_PATH: &str = "composition.json";
+/// The session autosaved on exit (and periodically) for "open last session".
+pub const SESSION_PATH: &str = "last_session.json";
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 const PORT_RADIUS: f32 = 9.0;
 const PORT_HIT_RADIUS: f32 = 18.0;
 const SIDEBAR_WIDTH: f32 = 220.0;
@@ -58,7 +61,7 @@ const PROP_BOX_H: f32 = 20.0;
 const DROPDOWN_MAX_ROWS: usize = 10;
 const SCROLL_LINE_PIXELS: f32 = 40.0;
 const ZOOM_MIN: f32 = 0.25;
-const ZOOM_MAX: f32 = 3.0;
+const ZOOM_MAX: f32 = 2.0;
 const ZOOM_KEY_STEP: f32 = 1.2;
 /// A press that moves less than this (screen px) before release is a click.
 const CLICK_SLOP: f32 = 3.0;
@@ -100,7 +103,7 @@ impl ModuleChrome {
 enum Slot {
     Main,
     Prop(usize),
-    /// One of a module's own fixed fields (Map/Clamp ranges, WLED's Raw max).
+    /// One of a module's own fixed fields (Map's ranges and bias, WLED's Raw max).
     Field(usize),
 }
 
@@ -123,6 +126,8 @@ enum EditField {
 enum EditTarget {
     Param(ParamTarget, EditField),
     GroupTitle(u64),
+    /// A saved group's name in the sidebar (index into `presets`).
+    PresetName(usize),
     /// The WLED panel's "add by IP / host name" field.
     WledAddress,
 }
@@ -179,8 +184,8 @@ enum SidebarRow {
 #[derive(Clone)]
 enum SidebarAction {
     Spawn(ModuleKind),
-    /// Spawns the shader node for this file, with the file already loaded.
-    Shader { file: String },
+    /// Spawns the shader node of this role, its list limited to one category.
+    ShaderCategory { category: String, role: ShaderRole },
     /// A saved group from the personal palette, by index into `presets`.
     Preset(usize),
 }
@@ -227,11 +232,19 @@ pub struct Model {
     dropdown_scroll: f32,
     /// Right-click menu on the canvas, at this screen position.
     canvas_menu: Option<Point2>,
+    /// Right-click menu on a saved group (sidebar) or a group frame (canvas).
+    item_menu: Option<ItemMenu>,
     /// WLED controllers: discovery + one poller thread each.
     wled: WledManager,
     wled_open: bool,
     /// Devices found by a background scan or host-name lookup.
     wled_found: (mpsc::Sender<Vec<DiscoveredDevice>>, mpsc::Receiver<Vec<DiscoveredDevice>>),
+    /// File dialogs run on a thread of their own; answers come back here.
+    dialog: (mpsc::Sender<Option<DialogReply>>, mpsc::Receiver<Option<DialogReply>>),
+    dialog_open: bool,
+    last_autosave: Instant,
+    /// The project file Save writes to in project mode (the last one saved or loaded).
+    project: Option<std::path::PathBuf>,
     wled_scanning: bool,
     /// When and where the last left click landed, for double-clicks.
     last_click: Option<(Instant, Point2)>,
@@ -343,6 +356,9 @@ impl Timings {
 enum SettingsRow {
     ShowFps,
     ExitButton,
+    ProjectMode,
+    RestoreSession,
+    StartFullscreen,
     Palette,
     /// Expands/collapses the rows below; not a setting itself.
     DebugSection,
@@ -353,14 +369,14 @@ enum SettingsRow {
 fn settings_rows(debug_open: bool) -> &'static [SettingsRow] {
     use SettingsRow::*;
     if debug_open {
-        &[ShowFps, ExitButton, Palette, DebugSection, DebugLog, SerializeGrabs]
+        &[ShowFps, ExitButton, ProjectMode, RestoreSession, StartFullscreen, Palette, DebugSection, DebugLog, SerializeGrabs]
     } else {
-        &[ShowFps, ExitButton, Palette, DebugSection]
+        &[ShowFps, ExitButton, ProjectMode, RestoreSession, StartFullscreen, Palette, DebugSection]
     }
 }
 
 fn main() {
-    nannou::app(model).update(update).event(event).run();
+    nannou::app(model).update(update).event(event).exit(exit).run();
 }
 
 fn model(app: &App) -> Model {
@@ -411,9 +427,14 @@ fn model(app: &App) -> Model {
         sidebar_scroll: 0.0,
         dropdown_scroll: 0.0,
         canvas_menu: None,
+        item_menu: None,
         wled: start_wled(&settings),
         wled_open: false,
         wled_found: mpsc::channel(),
+        dialog: mpsc::channel(),
+        dialog_open: false,
+        last_autosave: Instant::now(),
+        project: None,
         wled_scanning: false,
         last_click: None,
         cursor: CursorIcon::Default,
@@ -423,7 +444,23 @@ fn model(app: &App) -> Model {
         view_time: Cell::new(Duration::ZERO),
     };
     model.output_id = push_module(&mut model, ModuleKind::Output, canvas.xy());
+    if model.settings.restore_session && std::path::Path::new(SESSION_PATH).exists() {
+        match load_composition(&mut model, app.window_rect(), std::path::Path::new(SESSION_PATH)) {
+            Ok(()) => model.notify("Reopened the last session"),
+            Err(err) => model.status = Some((format!("Couldn't reopen the last session: {err}"), true, Instant::now())),
+        }
+    }
+    if model.settings.start_fullscreen {
+        enter_fullscreen(app, &mut model);
+    }
     model
+}
+
+/// Keeps the session for the next start.
+fn exit(_app: &App, model: Model) {
+    if model.settings.restore_session {
+        let _ = save_composition_to(&model, std::path::Path::new(SESSION_PATH));
+    }
 }
 
 fn camera_names(cameras: &[CameraInfo]) -> String {
@@ -533,7 +570,13 @@ fn update(app: &App, model: &mut Model, update: Update) {
         }
     }
 
+    poll_dialogs(app, model);
+    if model.settings.restore_session && model.last_autosave.elapsed() > AUTOSAVE_EVERY {
+        model.last_autosave = Instant::now();
+        let _ = save_composition_to(model, std::path::Path::new(SESSION_PATH));
+    }
     step_lags(app, model, update.since_last.as_secs_f32());
+    step_maps(app, model);
     step_videos(app, model, update.since_last.as_secs_f64());
     step_wled(model);
     graph::run_graph(app, model, update.since_last.as_secs_f32());
@@ -679,6 +722,26 @@ fn step_lags(app: &App, model: &mut Model, dt: f32) {
     }
 }
 
+/// Maps in autorange mode learn their From range from their input.
+fn step_maps(app: &App, model: &mut Model) {
+    let inputs: Vec<(usize, Option<f32>)> = model
+        .modules
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(&m.body, ModuleBody::Map(map) if map.auto))
+        .map(|(i, m)| {
+            let input = input_source(&model.connections, m.id, 0)
+                .and_then(|src| module_number(&model.modules, &model.connections, src, app.time, &mut vec![m.id]));
+            (i, input)
+        })
+        .collect();
+    for (i, input) in inputs {
+        if let ModuleBody::Map(map) = &mut model.modules[i].body {
+            map.learn(input);
+        }
+    }
+}
+
 /// Trackpad pinch, which nannou's simplified events don't carry.
 fn raw_window_event(app: &App, model: &mut Model, event: &nannou::winit::event::WindowEvent) {
     if let nannou::winit::event::WindowEvent::TouchpadMagnify { delta, .. } = event {
@@ -730,7 +793,7 @@ fn event(app: &App, model: &mut Model, event: Event) {
                         let ch = if ch == ',' { '.' } else { ch };
                         (ch.is_ascii_digit() || ch == '.' || ch == '-').then_some(ch)
                     }
-                    EditTarget::GroupTitle(_) => (!ch.is_control()).then_some(ch),
+                    EditTarget::GroupTitle(_) | EditTarget::PresetName(_) => (!ch.is_control()).then_some(ch),
                     EditTarget::WledAddress => (ch.is_ascii_alphanumeric() || ".:-_".contains(ch)).then_some(ch),
                 };
                 if let Some(ch) = accepted {
@@ -756,6 +819,7 @@ fn event(app: &App, model: &mut Model, event: Event) {
             if model.view != View::Config {
                 return;
             }
+            let is_wheel = matches!(delta, MouseScrollDelta::LineDelta(..));
             let mut d = match delta {
                 MouseScrollDelta::LineDelta(x, y) => vec2(x, y) * SCROLL_LINE_PIXELS,
                 MouseScrollDelta::PixelDelta(p) => vec2(p.x as f32, p.y as f32),
@@ -777,11 +841,12 @@ fn event(app: &App, model: &mut Model, event: Event) {
             if popup_open(model) {
                 return;
             }
-            if mods.logo() || mods.ctrl() {
+            // The mouse wheel zooms around the cursor (Shift: scroll sideways
+            // instead); a trackpad scrolls, and zooms with Cmd/Ctrl held.
+            if (is_wheel && !mods.shift()) || mods.logo() || mods.ctrl() {
                 zoom_at(model, screen, (d.y * 0.005).exp());
                 return;
             }
-            // A plain mouse wheel only scrolls vertically; Shift sends it sideways.
             if mods.shift() && d.x == 0.0 {
                 d = vec2(d.y, 0.0);
             }
@@ -933,6 +998,7 @@ fn close_popups(model: &mut Model) {
     model.param_menu = None;
     model.palette_open = false;
     model.canvas_menu = None;
+    model.item_menu = None;
     model.dropdown_scroll = 0.0;
     for module in &mut model.modules {
         match &mut module.body {
@@ -1002,7 +1068,6 @@ fn param_slots(module: &PlacedModule) -> Vec<Slot> {
         }
         ModuleBody::Shader(s) => (0..s.params.len()).map(Slot::Prop).collect(),
         ModuleBody::Map(m) => (0..m.fields.len()).map(Slot::Field).collect(),
-        ModuleBody::Clamp(c) => (0..c.fields.len()).map(Slot::Field).collect(),
         ModuleBody::Wled(_) => vec![Slot::Field(0)],
         _ => Vec::new(),
     }
@@ -1017,7 +1082,6 @@ fn param_of(module: &PlacedModule, slot: Slot) -> Option<Param> {
         (ModuleBody::Video(v), Slot::Main) => Some(v.speed),
         (ModuleBody::Shader(s), Slot::Prop(i)) => s.params.get(i).copied(),
         (ModuleBody::Map(m), Slot::Field(i)) => m.fields.get(i).copied(),
-        (ModuleBody::Clamp(c), Slot::Field(i)) => c.fields.get(i).copied(),
         (ModuleBody::Wled(w), Slot::Field(0)) => Some(w.raw_max),
         _ => None,
     }
@@ -1033,7 +1097,6 @@ fn edit_param(model: &mut Model, target: ParamTarget, f: impl FnOnce(&mut Param)
         (ModuleBody::Lag(l), Slot::Main) => f(&mut l.time),
         (ModuleBody::Video(v), Slot::Main) => f(&mut v.speed),
         (ModuleBody::Map(m), Slot::Field(i)) if i < m.fields.len() => f(&mut m.fields[i]),
-        (ModuleBody::Clamp(c), Slot::Field(i)) if i < c.fields.len() => f(&mut c.fields[i]),
         (ModuleBody::Wled(w), Slot::Field(0)) => f(&mut w.raw_max),
         (ModuleBody::Shader(s), Slot::Prop(i)) => {
             if let Some(p) = s.params.get_mut(i) {
@@ -1099,7 +1162,6 @@ fn param_view(model: &Model, module: &PlacedModule, slot: Slot, now: f32) -> Opt
         }
         (ModuleBody::Video(_), _) => format!("Speed {}\u{00D7}{suffix}", fmt_num(shown)),
         (ModuleBody::Map(_), Slot::Field(i)) => format!("{} {}", modules::math::map::MAP_LABELS[i], fmt_num(shown)),
-        (ModuleBody::Clamp(_), Slot::Field(i)) => format!("{} {}", modules::math::map::CLAMP_LABELS[i], fmt_num(shown)),
         (ModuleBody::Wled(_), _) => format!("Raw max {:.0}", shown),
         _ => format!("{}{suffix}", fmt_num(shown)),
     };
@@ -1114,9 +1176,8 @@ fn param_title(module: &PlacedModule, slot: Slot) -> String {
         (ModuleBody::Lag(_), _) => "Lag \u{00B7} Time (s)".into(),
         (ModuleBody::Video(_), _) => "Video \u{00B7} Speed (\u{00D7})".into(),
         (ModuleBody::Map(_), Slot::Field(i)) => {
-            ["Map \u{00B7} From min", "Map \u{00B7} From max", "Map \u{00B7} To min", "Map \u{00B7} To max"][i.min(3)].into()
+            ["Map \u{00B7} From min", "Map \u{00B7} From max", "Map \u{00B7} To min", "Map \u{00B7} To max", "Map \u{00B7} Bias (added to the input)"][i.min(4)].into()
         }
-        (ModuleBody::Clamp(_), Slot::Field(i)) => ["Clamp \u{00B7} Min", "Clamp \u{00B7} Max"][i.min(1)].into(),
         (ModuleBody::Wled(_), _) => "WLED \u{00B7} Raw max (full-scale reading)".into(),
         (ModuleBody::Shader(s), Slot::Prop(i)) => {
             format!("Shader \u{00B7} {}", s.props().get(i).map_or("", |p| p.label.as_str()))
@@ -1203,6 +1264,13 @@ fn commit_edit(model: &mut Model) {
                 g.title = title.to_string();
             }
         }
+        EditTarget::PresetName(i) => {
+            let name = edit.buffer.trim();
+            if let (false, Some(p)) = (name.is_empty(), model.presets.get_mut(i)) {
+                p.name = name.to_string();
+                save::save_presets(&model.presets);
+            }
+        }
     }
 }
 
@@ -1212,6 +1280,14 @@ fn editing_text(model: &Model, target: ParamTarget, field: EditField) -> Option<
         .editing
         .as_ref()
         .filter(|e| e.target == EditTarget::Param(target, field))
+        .map(|e| e.buffer.as_str())
+}
+
+fn editing_preset(model: &Model, index: usize) -> Option<&str> {
+    model
+        .editing
+        .as_ref()
+        .filter(|e| e.target == EditTarget::PresetName(index))
         .map(|e| e.buffer.as_str())
 }
 
@@ -1296,6 +1372,9 @@ fn delete_modules(model: &mut Model, ids: &[u64]) {
     }
 }
 
+/// Saves group `id` to My groups. A favorite with the same modules and
+/// parameters isn't added twice: it just takes the group's current name.
+/// Anything else that differs becomes a new favorite.
 fn save_group_to_palette(model: &mut Model, id: u64) {
     let Some(g) = model.groups.iter().find(|g| g.id == id) else { return };
     let name = g.title.clone();
@@ -1303,9 +1382,142 @@ fn save_group_to_palette(model: &mut Model, id: u64) {
     if snippet.is_empty() {
         return;
     }
-    model.presets.push(Preset { name: name.clone(), snippet });
+    let print = snippet.fingerprint();
+    let message = match model.presets.iter_mut().find(|p| p.snippet.fingerprint() == print) {
+        Some(existing) if existing.name == name => format!("\u{201C}{name}\u{201D} is already in My groups"),
+        Some(existing) => {
+            let old = std::mem::replace(&mut existing.name, name.clone());
+            existing.snippet = snippet;
+            format!("Renamed favorite \u{201C}{old}\u{201D} to \u{201C}{name}\u{201D}")
+        }
+        None => {
+            model.presets.push(Preset { name: name.clone(), snippet });
+            format!("Saved \u{201C}{name}\u{201D} to My groups")
+        }
+    };
     save::save_presets(&model.presets);
-    model.notify(format!("Saved \u{201C}{name}\u{201D} to My groups"));
+    model.notify(message);
+}
+
+/// What a right-click menu on a saved group or a group frame is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemTarget {
+    Preset(usize),
+    Group(u64),
+    /// Save would replace `composition.json`: overwrite it or pick a name.
+    SaveConflict,
+}
+
+struct ItemMenu {
+    at: Point2,
+    target: ItemTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemCommand {
+    InsertPreset(usize),
+    RenamePreset(usize),
+    MovePresetUp(usize),
+    MovePresetDown(usize),
+    DeletePreset(usize),
+    RenameGroup(u64),
+    SyncGroup(u64),
+    ToggleGroup(u64),
+    UngroupGroup(u64),
+    SaveOverwrite,
+    SaveAsOtherName,
+    Dismiss,
+}
+
+fn item_menu_items(model: &Model, target: ItemTarget) -> Vec<(&'static str, ItemCommand)> {
+    use ItemCommand::*;
+    match target {
+        ItemTarget::Preset(i) => {
+            let mut items = vec![("Add to canvas", InsertPreset(i)), ("Rename", RenamePreset(i))];
+            if i > 0 {
+                items.push(("Move up", MovePresetUp(i)));
+            }
+            if i + 1 < model.presets.len() {
+                items.push(("Move down", MovePresetDown(i)));
+            }
+            items.push(("Delete", DeletePreset(i)));
+            items
+        }
+        ItemTarget::SaveConflict => vec![
+            ("Overwrite existing file", SaveOverwrite),
+            ("Save with another name\u{2026}", SaveAsOtherName),
+            ("Cancel", Dismiss),
+        ],
+        ItemTarget::Group(id) => {
+            let collapsed = model.groups.iter().find(|g| g.id == id).is_some_and(|g| g.collapsed);
+            vec![
+                ("Rename", RenameGroup(id)),
+                ("Sync with favorite", SyncGroup(id)),
+                (if collapsed { "Expand" } else { "Collapse" }, ToggleGroup(id)),
+                ("Ungroup", UngroupGroup(id)),
+            ]
+        }
+    }
+}
+
+fn run_item_command(model: &mut Model, win: Rect, command: ItemCommand) {
+    match command {
+        ItemCommand::InsertPreset(i) => {
+            if let Some(snippet) = model.presets.get(i).map(|p| p.snippet.clone()) {
+                let at = to_world(model, canvas_rect(win).xy());
+                model.selected = save::paste(model, &snippet, at);
+            }
+        }
+        ItemCommand::RenamePreset(i) => {
+            if let Some(name) = model.presets.get(i).map(|p| p.name.clone()) {
+                model.editing = Some(TextEdit { target: EditTarget::PresetName(i), buffer: name, fresh: true });
+                model.notify("Type the new name, Enter to confirm, Esc to cancel");
+            }
+        }
+        ItemCommand::MovePresetUp(i) if i > 0 && i < model.presets.len() => {
+            model.presets.swap(i, i - 1);
+            save::save_presets(&model.presets);
+        }
+        ItemCommand::MovePresetDown(i) if i + 1 < model.presets.len() => {
+            model.presets.swap(i, i + 1);
+            save::save_presets(&model.presets);
+        }
+        ItemCommand::DeletePreset(i) if i < model.presets.len() => {
+            let preset = model.presets.remove(i);
+            save::save_presets(&model.presets);
+            model.notify(format!("Removed \u{201C}{}\u{201D} from My groups", preset.name));
+        }
+        ItemCommand::RenameGroup(id) => start_group_rename(model, id),
+        ItemCommand::SyncGroup(id) => save_group_to_palette(model, id),
+        ItemCommand::ToggleGroup(id) => {
+            if let Some(g) = model.groups.iter_mut().find(|g| g.id == id) {
+                g.collapsed = !g.collapsed;
+            }
+        }
+        ItemCommand::UngroupGroup(id) => model.groups.retain(|g| g.id != id),
+        ItemCommand::SaveOverwrite => {
+            let (message, is_error) = match save_composition(model) {
+                Ok(()) => (format!("Saved to {SAVE_PATH}"), false),
+                Err(err) => (format!("Save failed: {err}"), true),
+            };
+            model.status = Some((message, is_error, Instant::now()));
+        }
+        ItemCommand::SaveAsOtherName => open_dialog(model, || {
+            pollster::block_on(
+                rfd::AsyncFileDialog::new().add_filter("Composition (*.json)", &["json"]).set_file_name(SAVE_PATH).save_file(),
+            )
+            .map(|f| DialogReply::SaveProject(f.path().to_path_buf()))
+        }),
+        ItemCommand::Dismiss => {}
+        _ => {}
+    }
+}
+
+fn start_group_rename(model: &mut Model, id: u64) {
+    if let Some(title) = model.groups.iter().find(|g| g.id == id).map(|g| g.title.clone()) {
+        model.editing = Some(TextEdit { target: EditTarget::GroupTitle(id), buffer: title, fresh: true });
+        model.notify("Type the new name, Enter to confirm, Esc to cancel");
+    }
 }
 
 /// Where a click lands on nothing: no module, group, sidebar or panel.
@@ -1370,11 +1582,15 @@ fn handle_press(app: &App, model: &mut Model, win: Rect, mouse: Point2) {
         return;
     }
     let mods = app.keys.mods;
-    handle_press_config(model, win, mouse, mods.shift(), mods.logo() || mods.ctrl());
+    handle_press_config(model, win, mouse, mods.shift(), mods.logo() || mods.ctrl(), app.time);
 }
 
 fn popup_open(model: &Model) -> bool {
-    model.param_menu.is_some() || model.palette_open || model.canvas_menu.is_some() || open_dropdown(model).is_some()
+    model.param_menu.is_some()
+        || model.palette_open
+        || model.canvas_menu.is_some()
+        || model.item_menu.is_some()
+        || open_dropdown(model).is_some()
 }
 
 fn open_dropdown(model: &Model) -> Option<usize> {
@@ -1393,7 +1609,7 @@ fn open_dropdown(model: &Model) -> Option<usize> {
 fn handle_right_press(model: &mut Model, win: Rect, screen: Point2) {
     commit_edit(model);
     close_popups(model);
-    // Right-clicking a saved group in the sidebar removes it.
+    // Right-clicking a saved group in the sidebar opens its options.
     if sidebar_rect(win).contains(screen) {
         let hit = sidebar_items(model, win).into_iter().find_map(|row| match row {
             SidebarRow::Module { row_rect, action, .. } if row_rect.contains(screen) && sidebar_list_rect(win).contains(screen) => {
@@ -1401,13 +1617,10 @@ fn handle_right_press(model: &mut Model, win: Rect, screen: Point2) {
             }
             _ => None,
         });
-        match hit {
-            Some(SidebarAction::Preset(i)) if i < model.presets.len() => {
-                let preset = model.presets.remove(i);
-                save::save_presets(&model.presets);
-                model.notify(format!("Removed \u{201C}{}\u{201D} from My groups", preset.name));
+        if let Some(SidebarAction::Preset(i)) = hit {
+            if i < model.presets.len() {
+                model.item_menu = Some(ItemMenu { at: screen, target: ItemTarget::Preset(i) });
             }
-            _ => {}
         }
         return;
     }
@@ -1415,6 +1628,17 @@ fn handle_right_press(model: &mut Model, win: Rect, screen: Point2) {
     model.param_menu = param_at(model, world);
     if model.param_menu.is_some() {
         return;
+    }
+    // A group's title bar (or its collapsed box): the group's options.
+    let on_module = model.modules.iter().any(|m| !model.hidden(m.id) && module_body_rect(m).contains(world));
+    if !on_module {
+        let hit = model.groups.iter().rev().find(|g| {
+            model.group_frame(g).is_some_and(|f| if g.collapsed { f.contains(world) } else { group::title_rect(f).contains(world) })
+        });
+        if let Some(g) = hit {
+            model.item_menu = Some(ItemMenu { at: screen, target: ItemTarget::Group(g.id) });
+            return;
+        }
     }
     // Anywhere else on the canvas: the context menu. Right-clicking an
     // unselected module selects it first, so the menu acts on it.
@@ -1614,13 +1838,21 @@ fn toggle_minimized(model: &mut Model) {
     }
 }
 
-fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift: bool, cmd: bool) {
+fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift: bool, cmd: bool, now: f32) {
     // Sidebar, buttons and popovers live in screen space; modules in world space.
     let mouse = to_world(model, screen_mouse);
     let double_click = model
         .last_click
         .is_some_and(|(at, pos)| at.elapsed() < Duration::from_millis(400) && pos.distance(screen_mouse) < 6.0);
     model.last_click = Some((Instant::now(), screen_mouse));
+
+    if let Some(menu) = model.item_menu.take() {
+        let items = item_menu_items(model, menu.target);
+        if let Some(i) = (0..items.len()).find(|&i| canvas_menu_row(win, menu.at, items.len(), i).contains(screen_mouse)) {
+            run_item_command(model, win, items[i].1);
+        }
+        return;
+    }
 
     if let Some(at) = model.canvas_menu.take() {
         let items = canvas_menu_items(model);
@@ -1675,7 +1907,7 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
 
         // Shader rows: category headings do nothing and keep the list open.
         let shader_rows = match (&model.modules[open_idx].body, model.modules[open_idx].kind.shader_role()) {
-            (ModuleBody::Shader(_), Some(role)) => shader_rows(model, role),
+            (ModuleBody::Shader(sh), Some(role)) => shader_rows(model, role, sh.category.as_deref()),
             _ => Vec::new(),
         };
         if let Some(ShaderRow::Header(_)) = row.and_then(|r| shader_rows.get(r)) {
@@ -1778,6 +2010,9 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
                 SettingsRow::Palette => model.palette_open = true,
                 SettingsRow::ShowFps => settings.show_fps = !settings.show_fps,
                 SettingsRow::ExitButton => settings.show_exit_button = !settings.show_exit_button,
+                SettingsRow::ProjectMode => settings.project_mode = !settings.project_mode,
+                SettingsRow::RestoreSession => settings.restore_session = !settings.restore_session,
+                SettingsRow::StartFullscreen => settings.start_fullscreen = !settings.start_fullscreen,
                 SettingsRow::DebugLog => settings.debug_log = !settings.debug_log,
                 SettingsRow::SerializeGrabs => {
                     settings.serialize_camera_grabs = !settings.serialize_camera_grabs;
@@ -1791,6 +2026,28 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
     }
 
     if save_button_rect(win).contains(screen_mouse) {
+        // Project mode asks where to save and under what name.
+        if model.settings.project_mode {
+            let current = model.project.clone();
+            open_dialog(model, move || {
+                let mut dialog = rfd::AsyncFileDialog::new().add_filter("Project (*.json)", &["json"]);
+                dialog = match current.as_deref().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+                    Some(name) => dialog.set_file_name(name),
+                    None => dialog.set_file_name("project.json"),
+                };
+                if let Some(dir) = current.as_deref().and_then(|p| p.parent()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                pollster::block_on(dialog.save_file()).map(|f| DialogReply::SaveProject(f.path().to_path_buf()))
+            });
+            return;
+        }
+        // Sample mode: don't silently replace an existing file.
+        if std::path::Path::new(SAVE_PATH).exists() {
+            let at = save_button_rect(win).xy();
+            model.item_menu = Some(ItemMenu { at, target: ItemTarget::SaveConflict });
+            return;
+        }
         let (message, is_error) = match save_composition(model) {
             Ok(()) => (format!("Saved to {SAVE_PATH}"), false),
             Err(err) => (format!("Save failed: {err}"), true),
@@ -1800,17 +2057,15 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
     }
 
     if load_button_rect(win).contains(screen_mouse) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Composition (*.json)", &["json"])
-            .set_file_name(SAVE_PATH)
-            .pick_file()
-        {
-            let (message, is_error) = match load_composition(model, win, &path) {
-                Ok(()) => (format!("Loaded {}", path.display()), false),
-                Err(err) => (format!("Load failed: {err}"), true),
-            };
-            model.status = Some((message, is_error, Instant::now()));
-        }
+        open_dialog(model, || {
+            pollster::block_on(
+                rfd::AsyncFileDialog::new()
+                    .add_filter("Composition (*.json)", &["json"])
+                    .set_file_name(SAVE_PATH)
+                    .pick_file(),
+            )
+            .map(|f| DialogReply::Composition(f.path().to_path_buf()))
+        });
         return;
     }
 
@@ -1823,11 +2078,10 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             Some(SidebarAction::Spawn(kind)) => {
                 model.selected = vec![spawn_module(win, model, kind)];
             }
-            Some(SidebarAction::Shader { file }) => {
-                let role = model.shader_library.iter().find(|i| i.file == file).map_or(ShaderRole::Effect, |i| i.role);
+            Some(SidebarAction::ShaderCategory { category, role }) => {
                 let id = spawn_module(win, model, ModuleKind::for_shader_role(role));
                 if let Some(ModuleBody::Shader(shader)) = model.modules.iter_mut().find(|m| m.id == id).map(|m| &mut m.body) {
-                    shader.select(Some(file));
+                    shader.category = Some(category);
                 }
                 model.selected = vec![id];
             }
@@ -1907,11 +2161,26 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             }
         }
 
-        if let (ModuleBody::Map(map), false) = (&mut model.modules[i].body, minimized) {
-            if map_clamp_rect(body).contains(mouse) {
-                map.clamp = !map.clamp;
-                return;
+        if let (Some(button), false, true) = (map_button_at(body, mouse), minimized, matches!(model.modules[i].body, ModuleBody::Map(_))) {
+            let id = model.modules[i].id;
+            let input = input_source(&model.connections, id, 0)
+                .and_then(|src| module_number(&model.modules, &model.connections, src, now, &mut vec![id]));
+            if let ModuleBody::Map(map) = &mut model.modules[i].body {
+                match button {
+                    0 => {
+                        if let Some(x) = input {
+                            map.calibrate(x);
+                        }
+                    }
+                    1 => map.clamp = !map.clamp,
+                    2 => {
+                        map.auto = !map.auto;
+                        map.relearn();
+                    }
+                    _ => map.center = !map.center,
+                }
             }
+            return;
         }
         if !minimized && matches!(model.modules[i].body, ModuleBody::Wled(_)) {
             if config_rect(body).contains(mouse) {
@@ -1934,9 +2203,11 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
 
         if let (ModuleBody::Video(video), false) = (&mut model.modules[i].body, minimized) {
             if config_rect(body).contains(mouse) {
-                if let Some(path) = pick_video_file() {
-                    video.open(path);
-                }
+                let module = model.modules[i].id;
+                open_dialog(model, move || {
+                    pollster::block_on(rfd::AsyncFileDialog::new().add_filter("Video", VIDEO_EXTENSIONS).pick_file())
+                        .map(|f| DialogReply::Video { module, path: f.path().to_path_buf() })
+                });
                 return;
             }
             if video_play_rect(body).contains(mouse) {
@@ -2036,8 +2307,7 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
         let grab = if model.groups[gi].collapsed { frame } else { group::title_rect(frame) };
         if grab.contains(mouse) {
             if double_click {
-                let title = model.groups[gi].title.clone();
-                model.editing = Some(TextEdit { target: EditTarget::GroupTitle(gid), buffer: title, fresh: true });
+                start_group_rename(model, gid);
                 return;
             }
             let members = model.groups[gi].members.clone();
@@ -2072,8 +2342,7 @@ fn default_param(model: &Model, target: ParamTarget) -> Param {
         (Some(ModuleBody::Lfo(_)), _) => modules::math::lfo::LfoState::new().freq,
         (Some(ModuleBody::Lag(_)), _) => modules::math::lag::LagState::new().time,
         (Some(ModuleBody::Video(_)), _) => VideoState::new().speed,
-        (Some(ModuleBody::Map(_)), Slot::Field(i)) => modules::math::map::MapState::new().fields[i.min(3)],
-        (Some(ModuleBody::Clamp(_)), Slot::Field(i)) => modules::math::map::ClampState::new().fields[i.min(1)],
+        (Some(ModuleBody::Map(_)), Slot::Field(i)) => modules::math::map::MapState::new().fields[i.min(4)],
         (Some(ModuleBody::Wled(_)), _) => WledState::new().raw_max,
         (Some(ModuleBody::Blend(_)), _) => modules::mix::blend::BlendState::new().mix,
         (Some(ModuleBody::Shader(s)), Slot::Prop(i)) => s.props().get(i).map_or(Param::unit(0.0), |p| p.param()),
@@ -2136,6 +2405,7 @@ fn handle_release(app: &App, model: &mut Model) {
             if !moved.contains(&id) {
                 moved.push(id);
             }
+            join_group_under(model, &moved);
             push_overlapping(model, &moved);
             return;
         }
@@ -2170,6 +2440,14 @@ fn handle_release(app: &App, model: &mut Model) {
         }
         if target.is_some() {
             break;
+        }
+    }
+
+    // Dropped on another cable of the same signal type: it takes that
+    // cable's place on the input it feeds.
+    if target.is_none() {
+        if let Some(c) = cable_drop_target(model, from, mouse).and_then(|i| model.connections.get(i)) {
+            target = Some((c.to, c.to_input));
         }
     }
 
@@ -2226,7 +2504,7 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
                 ModuleBody::Camera(_) | ModuleBody::Shader(_) => config_rect(body).contains(world),
                 ModuleBody::Lfo(_) => mode_rect(module.kind, body).contains(world) || lfo_center_rect(body).contains(world),
                 ModuleBody::Wled(w) => config_rect(body).contains(world) || (0..w.inputs.len()).any(|r| wled_input_rect(body, r).contains(world)),
-                ModuleBody::Map(_) => map_clamp_rect(body).contains(world),
+                ModuleBody::Map(_) => map_button_at(body, world).is_some(),
                 ModuleBody::Video(_) => [config_rect(body), video_play_rect(body), video_loop_rect(body), video_scrub_rect(body).pad(-4.0)]
                     .iter()
                     .any(|r| r.contains(world)),
@@ -2408,20 +2686,21 @@ fn sidebar_rows(win: Rect, library: &[ShaderInfo], presets: &[Preset], scroll: f
         }
 
         // Every shader is an effect of its own, listed under its category.
+        // One node per shader category (and role); the shader is picked
+        // from the node's own list.
         if *category == "Effects" {
-            let mut current: Option<&str> = None;
+            let mut seen: Vec<(&str, ShaderRole)> = Vec::new();
             for info in library {
-                if current != Some(info.category.as_str()) {
-                    current = Some(&info.category);
-                    rows.push(SidebarRow::Header { rect: row(y, 22.0), label: info.category.clone(), sub: true });
-                    y -= 26.0;
+                if seen.contains(&(info.category.as_str(), info.role)) {
+                    continue;
                 }
+                seen.push((&info.category, info.role));
                 let row_rect = row(y, 28.0);
                 rows.push(SidebarRow::Module {
                     row_rect,
                     plus_rect: plus(row_rect),
-                    label: shader_display_name(&info.file),
-                    action: SidebarAction::Shader { file: info.file.clone() },
+                    label: info.category.clone(),
+                    action: SidebarAction::ShaderCategory { category: info.category.clone(), role: info.role },
                 });
                 y -= 32.0;
             }
@@ -2527,7 +2806,7 @@ fn dropdown_anchor(module: &PlacedModule) -> Rect {
     }
 }
 
-/// Map/Clamp range fields sit two per row from the config row down;
+/// Map's range and bias fields sit two per row from the config row down;
 /// WLED's Raw max sits under its input rows.
 fn field_rect(module: &PlacedModule, body: Rect, i: usize) -> Rect {
     if let ModuleBody::Wled(w) = &module.body {
@@ -2539,17 +2818,28 @@ fn field_rect(module: &PlacedModule, body: Rect, i: usize) -> Rect {
     Rect::from_x_y_w_h(x, row.y(), half, row.h())
 }
 
-/// Map's last row: the clamp toggle, then input -> output.
-fn map_clamp_rect(body: Rect) -> Rect {
-    let row = config_rect(body).shift_y(-72.0);
-    Rect::from_w_h(64.0, row.h()).mid_left_of(row)
+/// Map's buttons: Cal beside the bias box, then Clamp / Auto / Center in a row.
+const MAP_BUTTONS: [&str; 4] = ["Cal", "Clamp", "Auto", "Center"];
+
+fn map_button_rect(body: Rect, i: usize) -> Rect {
+    if i == 0 {
+        let row = config_rect(body).shift_y(-72.0);
+        let half = (row.w() - 6.0) / 2.0;
+        return Rect::from_x_y_w_h(row.right() - half / 2.0, row.y(), half, row.h());
+    }
+    let row = config_rect(body).shift_y(-108.0);
+    let w = (row.w() - 12.0) / 3.0;
+    Rect::from_x_y_w_h(row.left() + w / 2.0 + (i - 1) as f32 * (w + 6.0), row.y(), w, row.h())
+}
+
+fn map_button_at(body: Rect, p: Point2) -> Option<usize> {
+    (0..MAP_BUTTONS.len()).find(|&i| map_button_rect(body, i).contains(p))
 }
 
 fn math_readout_rect(module: &PlacedModule, body: Rect) -> Rect {
     match module.kind {
         ModuleKind::Map => {
-            let row = config_rect(body).shift_y(-72.0);
-            row.pad_left(70.0)
+            config_rect(body).shift_y(-144.0)
         }
         _ => config_rect(body).shift_y(-36.0),
     }
@@ -2756,8 +3046,74 @@ fn is_video_file(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-fn pick_video_file() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new().add_filter("Video", VIDEO_EXTENSIONS).pick_file()
+/// What a file dialog (run off the main thread, so the mixer keeps drawing
+/// and rendering while it's open) picked.
+enum DialogReply {
+    Composition(std::path::PathBuf),
+    SaveProject(std::path::PathBuf),
+    Video { module: u64, path: std::path::PathBuf },
+}
+
+/// Runs `pick` on its own thread; its answer (`None` if cancelled) arrives
+/// in `update`. One dialog at a time.
+fn open_dialog(model: &mut Model, pick: impl FnOnce() -> Option<DialogReply> + Send + 'static) {
+    if model.dialog_open {
+        return;
+    }
+    model.dialog_open = true;
+    let tx = model.dialog.0.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(pick());
+    });
+}
+
+/// Makes `path` the current project and shows its name in the window title.
+fn set_project(app: &App, model: &mut Model, path: std::path::PathBuf) {
+    let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("project").to_string();
+    app.main_window().set_title(&format!("Video Mixer \u{2014} {name}"));
+    model.project = Some(path);
+}
+
+/// Applies a finished dialog.
+fn poll_dialogs(app: &App, model: &mut Model) {
+    while let Ok(reply) = model.dialog.1.try_recv() {
+        model.dialog_open = false;
+        match reply {
+            Some(DialogReply::SaveProject(mut path)) => {
+                if path.extension().is_none() {
+                    path.set_extension("json");
+                }
+                let (message, is_error) = match save_composition_to(model, &path) {
+                    Ok(()) => {
+                        if model.settings.project_mode {
+                            set_project(app, model, path.clone());
+                        }
+                        (format!("Saved {}", path.display()), false)
+                    }
+                    Err(err) => (format!("Save failed: {err}"), true),
+                };
+                model.status = Some((message, is_error, Instant::now()));
+            }
+            Some(DialogReply::Composition(path)) => {
+                let (message, is_error) = match load_composition(model, app.window_rect(), &path) {
+                    Ok(()) => {
+                        if model.settings.project_mode {
+                            set_project(app, model, path.clone());
+                        }
+                        (format!("Loaded {}", path.display()), false)
+                    }
+                    Err(err) => (format!("Load failed: {err}"), true),
+                };
+                model.status = Some((message, is_error, Instant::now()));
+            }
+            Some(DialogReply::Video { module, path }) => {
+                if let Some(ModuleBody::Video(video)) = model.modules.iter_mut().find(|m| m.id == module).map(|m| &mut m.body) {
+                    video.open(path);
+                }
+            }
+            None => {}
+        }
+    }
 }
 
 /// `base` is the module's height without the preview strip; the strip sits
@@ -2851,7 +3207,7 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
             let world = draw.translate(model.pan.extend(0.0)).scale(model.zoom);
             let world_hover = hover.map(|m| to_world(model, m));
             draw_groups(&world, t, model, app.time, world_hover);
-            draw_cables(&world, t, model);
+            draw_cables(&world, t, model, to_world(model, pt2(app.mouse.x, app.mouse.y)));
             for module in model.modules.iter().filter(|m| !model.hidden(m.id)) {
                 draw_module(&world, t, model, module, app.time, world_hover);
             }
@@ -2867,7 +3223,7 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
             }
 
             ui::accent_button(&draw, t, start_button_rect(win), "Fullscreen  (F)", hover.is_some_and(|m| start_button_rect(win).contains(m)));
-            draw_sidebar(&draw, t, win, model, hover);
+            draw_sidebar(&draw, t, win, model, hover, app.time);
             if model.settings_open {
                 draw_settings_panel(&draw, t, win, model, hover);
             }
@@ -2910,6 +3266,13 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
                 ui::dropdown(&draw, t, &rows, &labels, selected, hovered, &[]);
             }
             draw_param_menu(&draw, t, win, model, mouse, app.time);
+            if let Some(menu) = &model.item_menu {
+                let items = item_menu_items(model, menu.target);
+                let rows: Vec<Rect> = (0..items.len()).map(|i| canvas_menu_row(win, menu.at, items.len(), i)).collect();
+                let labels: Vec<String> = items.iter().map(|(label, _)| label.to_string()).collect();
+                let hovered = rows.iter().position(|r| r.contains(mouse));
+                ui::dropdown(&draw, t, &rows, &labels, None, hovered, &[]);
+            }
             if let Some(at) = model.canvas_menu {
                 let items = canvas_menu_items(model);
                 let rows: Vec<Rect> = (0..items.len()).map(|i| canvas_menu_row(win, at, items.len(), i)).collect();
@@ -2971,7 +3334,7 @@ fn draw_debug_log(draw: &Draw, t: &Theme, win: Rect) {
     }
 }
 
-fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<Point2>) {
+fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<Point2>, now: f32) {
     let sidebar = sidebar_rect(win);
     draw.rect().xy(sidebar.xy()).wh(sidebar.wh()).color(t.sidebar);
     let hovered = |r: Rect| hover.is_some_and(|m| r.contains(m));
@@ -3002,11 +3365,20 @@ fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<
                 }
                 match action {
                     SidebarAction::Spawn(_) => ui::label_left(draw, row_rect, &label, t.text, 14),
-                    SidebarAction::Shader { .. } => ui::label_left(draw, row_rect.pad_left(10.0).pad_right(28.0), &label, t.text, 13),
-                    SidebarAction::Preset(_) => {
+                    SidebarAction::ShaderCategory { .. } => ui::label_left(draw, row_rect.pad_left(10.0).pad_right(28.0), &label, t.text, 13),
+                    SidebarAction::Preset(i) => {
                         let icon = Rect::from_x_y_w_h(row_rect.left() + 18.0, row_rect.y(), 14.0, 11.0);
                         ui::rounded_outline(draw, icon, 3.0, t.accent, 1.5);
-                        ui::label_left(draw, row_rect.pad_left(18.0).pad_right(28.0), &label, t.text, 13);
+                        let text_rect = row_rect.pad_left(18.0).pad_right(28.0);
+                        match editing_preset(model, i) {
+                            Some(typed) => {
+                                let caret = (now * 2.0) as i32 % 2 == 0;
+                                ui::rounded(draw, text_rect.pad(2.0), ui::RADIUS, t.field);
+                                ui::rounded_outline(draw, text_rect.pad(2.0), ui::RADIUS, t.accent, 1.5);
+                                ui::label_left(draw, text_rect.pad_left(4.0), &format!("{typed}{}", if caret { "|" } else { "" }), t.field_text, 13);
+                            }
+                            None => ui::label_left(draw, text_rect, &label, t.text, 13),
+                        }
                     }
                 }
                 ui::rounded(draw, plus_rect, ui::RADIUS - 1.0, if over { t.accent_hover } else { t.accent });
@@ -3084,6 +3456,7 @@ fn draw_title_buttons(draw: &Draw, t: &Theme, body: Rect, buttons: &[TitleButton
 
 fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now: f32, hover: Option<Point2>) {
     let chrome = module.body.chrome();
+    let no_signal = source_has_no_signal(module);
     let body = module_body_rect(module);
     let hovered = |r: Rect| hover.is_some_and(|m| r.contains(m));
 
@@ -3105,7 +3478,11 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
     let buttons = title_buttons_for(module.kind);
     let title_rect = Rect::from_x_y_w_h(body.x(), band.y(), body.w(), 24.0).pad_right(buttons.len() as f32 * 24.0 + 8.0);
     let title = match &module.body {
-        ModuleBody::Shader(s) => s.file.as_deref().map_or_else(|| kind_label(module.kind).to_string(), shader_display_name),
+        ModuleBody::Shader(s) => match (&s.file, &s.category) {
+            (Some(file), _) => shader_display_name(file),
+            (None, Some(category)) => category.clone(),
+            (None, None) => kind_label(module.kind).to_string(),
+        },
         _ => kind_label(module.kind).to_string(),
     };
     ui::label_left(draw, title_rect, &title, t.title_text, 15);
@@ -3120,10 +3497,16 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
                 }
                 ModuleBody::Video(video) => draw_video_controls(draw, t, model, module.id, video, body, &hovered),
                 ModuleBody::Wled(w) => draw_wled_controls(draw, t, model, w, body, &hovered),
-                ModuleBody::Map(_) | ModuleBody::Clamp(_) => {
-                    if let ModuleBody::Map(map) = &module.body {
-                        let pill = map_clamp_rect(body);
-                        ui::pill_sized(draw, t, pill, "Clamp", map.clamp, hovered(pill), 11);
+                ModuleBody::Map(map) => {
+                    for (i, label) in MAP_BUTTONS.iter().enumerate() {
+                        let rect = map_button_rect(body, i);
+                        let on = match i {
+                            1 => map.clamp,
+                            2 => map.auto,
+                            3 => map.center,
+                            _ => false,
+                        };
+                        ui::pill_sized(draw, t, rect, label, on, hovered(rect), 11);
                     }
                     let input = input_source(&model.connections, module.id, 0)
                         .and_then(|src| module_number(&model.modules, &model.connections, src, now, &mut vec![module.id]));
@@ -3135,8 +3518,12 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
                     ui::label_left(draw, math_readout_rect(module, body), &text, t.title_text, 12);
                 }
                 ModuleBody::Shader(shader) => {
-                    let label = shader.file.as_deref().unwrap_or("Select a shader");
-                    ui::selector(draw, t, config, label, hovered(config) || shader.dropdown_open);
+                    let label = match (&shader.file, &shader.category) {
+                        (Some(file), _) => shader_display_name(file),
+                        (None, Some(category)) => format!("Select {category}"),
+                        (None, None) => "Select a shader".to_string(),
+                    };
+                    ui::selector(draw, t, config, &label, hovered(config) || shader.dropdown_open);
                 }
                 ModuleBody::Mult(_) => {
                     let value = module_number(&model.modules, &model.connections, module.id, now, &mut Vec::new());
@@ -3190,11 +3577,11 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
 
         if chrome.show_preview {
             let preview = preview_rect(body, module.base_height(), has_config_row(module.kind));
-            draw_preview(draw, t, preview, chrome.preview_texture.as_ref());
+            draw_preview(draw, t, preview, chrome.preview_texture.as_ref(), no_signal);
         }
     } else if chrome.show_preview {
         let preview = Rect::from_x_y_w_h(body.x(), body.top() - MINIMIZED_H - 4.0 - MINI_PREVIEW_H / 2.0, body.w() - 24.0, MINI_PREVIEW_H);
-        draw_preview(draw, t, preview, chrome.preview_texture.as_ref());
+        draw_preview(draw, t, preview, chrome.preview_texture.as_ref(), no_signal);
     }
 
     if let Some(port_type) = output_type(module.kind) {
@@ -3362,6 +3749,9 @@ fn draw_settings_panel(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: 
         match kind {
             SettingsRow::ShowFps => ui::toggle(draw, t, rect, "Show FPS", settings.show_fps, over),
             SettingsRow::ExitButton => ui::toggle(draw, t, rect, "Exit button in fullscreen", settings.show_exit_button, over),
+            SettingsRow::RestoreSession => ui::toggle(draw, t, rect, "Open last session on start", settings.restore_session, over),
+            SettingsRow::StartFullscreen => ui::toggle(draw, t, rect, "Start in fullscreen", settings.start_fullscreen, over),
+            SettingsRow::ProjectMode => ui::toggle(draw, t, rect, "Project mode (off: sample)", settings.project_mode, over),
             SettingsRow::Palette => {
                 ui::label_left(draw, rect, "Palette", t.text, 12);
                 let selector = rect.pad_left(110.0);
@@ -3422,10 +3812,10 @@ enum ShaderRow {
 
 /// "None", then each category heading followed by the files whose role the
 /// node lists (the library is sorted by category).
-fn shader_rows(model: &Model, role: ShaderRole) -> Vec<ShaderRow> {
+fn shader_rows(model: &Model, role: ShaderRole, only_category: Option<&str>) -> Vec<ShaderRow> {
     let mut rows = vec![ShaderRow::None];
     let mut category: Option<&str> = None;
-    for info in model.shader_library.iter().filter(|i| role.lists(i.role)) {
+    for info in model.shader_library.iter().filter(|i| role.lists(i.role) && only_category.map_or(true, |c| i.category == c)) {
         if category != Some(info.category.as_str()) {
             category = Some(&info.category);
             rows.push(ShaderRow::Header(info.category.clone()));
@@ -3454,8 +3844,8 @@ fn dropdown_labels(model: &Model, module: &PlacedModule) -> Vec<String> {
         ModuleBody::Wled(_) => wled_devices(model).into_iter().map(|(_, name)| name).collect(),
         _ => Vec::new(),
     };
-    if let (ModuleBody::Shader(_), Some(role)) = (&module.body, module.kind.shader_role()) {
-        return shader_rows(model, role)
+    if let (ModuleBody::Shader(sh), Some(role)) = (&module.body, module.kind.shader_role()) {
+        return shader_rows(model, role, sh.category.as_deref())
             .into_iter()
             .map(|r| match r {
                 ShaderRow::None => "None".to_string(),
@@ -3483,13 +3873,23 @@ fn dropdown_selected(model: &Model, module: &PlacedModule) -> usize {
         ModuleBody::Shader(s) => s
             .file
             .as_ref()
-            .and_then(|f| shader_rows(model, module.kind.shader_role()?).iter().position(|r| matches!(r, ShaderRow::File(l) if l == f)))
+            .and_then(|f| shader_rows(model, module.kind.shader_role()?, s.category.as_deref()).iter().position(|r| matches!(r, ShaderRow::File(l) if l == f)))
             .unwrap_or(0),
         _ => 0,
     }
 }
 
-fn draw_preview(draw: &Draw, t: &Theme, rect: Rect, texture: Option<&gpu::DrawTex>) {
+/// A camera or video that stopped delivering frames.
+fn source_has_no_signal(module: &PlacedModule) -> bool {
+    match &module.body {
+        ModuleBody::Camera(cam) => cam.no_signal(),
+        ModuleBody::Video(video) => video.no_signal(),
+        _ => false,
+    }
+}
+
+/// `no_signal` dims the (stale) frame under a "No Signal" caption.
+fn draw_preview(draw: &Draw, t: &Theme, rect: Rect, texture: Option<&gpu::DrawTex>, no_signal: bool) {
     ui::rounded(draw, rect, ui::RADIUS, BLACK.into_format().into());
     match texture {
         Some(texture) => {
@@ -3500,6 +3900,10 @@ fn draw_preview(draw: &Draw, t: &Theme, rect: Rect, texture: Option<&gpu::DrawTe
                 .w_h(img_w as f32 * scale, img_h as f32 * scale);
         }
         None => ui::label(draw, rect, "No Signal", t.text_dim, 13),
+    }
+    if no_signal && texture.is_some() {
+        ui::rounded(draw, rect, ui::RADIUS, rgba8(0, 0, 0, 170));
+        ui::label(draw, rect, "No Signal", t.text, 13);
     }
     ui::rounded_outline(draw, rect, ui::RADIUS, t.border, 1.0);
 }
@@ -3531,11 +3935,13 @@ fn cable_ends(model: &Model, c: &Connection) -> Option<(Point2, Point2)> {
     Some((start, end))
 }
 
-fn draw_cables(draw: &Draw, t: &Theme, model: &Model) {
+fn draw_cables(draw: &Draw, t: &Theme, model: &Model, mouse: Point2) {
     // While a module is dragged over a cable it could be inserted into, that
     // cable lights up.
     let candidate = match model.dragging {
         Some(Drag::Module { id, start, .. }) => insert_candidate(model, id, start).map(|(index, _)| index),
+        // A cable being dragged lights up the cable it would replace.
+        Some(Drag::Cable { from }) if !over_any_input_port(model, from, mouse) => cable_drop_target(model, from, mouse),
         _ => None,
     };
     for (index, c) in model.connections.iter().enumerate() {
@@ -3553,6 +3959,52 @@ const INSERT_MIN_DRAG: f32 = 6.0;
 /// The cable a dragged module would be inserted into, and which of its
 /// inputs takes the signal: the module must be the only one moving, sit on
 /// the cable, and have an unplugged input and an output of the cable's type.
+/// How close (world units) a dragged cable's end must be to another cable to replace it.
+const CABLE_DROP_RADIUS: f32 = 14.0;
+
+fn over_any_input_port(model: &Model, from: u64, world: Point2) -> bool {
+    let Some(from_type) = model.modules.iter().find(|m| m.id == from).and_then(|m| output_type(m.kind)) else { return false };
+    model.modules.iter().filter(|m| !model.hidden(m.id)).any(|m| {
+        let types = m.input_types();
+        let body = module_body_rect(m);
+        types.iter().enumerate().any(|(i, ty)| *ty == from_type && world.distance(module_input_port(m.kind, body, i, types.len())) <= PORT_HIT_RADIUS)
+    })
+}
+
+/// The existing cable (index into `connections`) that a cable dragged from
+/// `from` and dropped at `world` would replace: the nearest one of the same
+/// signal type under the pointer, if the swap wouldn't loop back.
+fn cable_drop_target(model: &Model, from: u64, world: Point2) -> Option<usize> {
+    let from_type = model.modules.iter().find(|m| m.id == from).and_then(|m| output_type(m.kind))?;
+    let mut best: Option<(usize, f32)> = None;
+    for (index, c) in model.connections.iter().enumerate() {
+        if c.from == from || c.to == from {
+            continue;
+        }
+        let Some((start, end)) = cable_ends(model, c) else { continue };
+        if model.modules.iter().find(|m| m.id == c.from).and_then(|m| output_type(m.kind)) != Some(from_type) {
+            continue;
+        }
+        if reaches(&model.connections, c.to, from, &mut Vec::new()) {
+            continue;
+        }
+        let points = cable_points(start, end);
+        let distance = points
+            .windows(2)
+            .map(|w| {
+                let (a, b) = (w[0], w[1]);
+                let ab = b - a;
+                let t = if ab.length_squared() > 0.0 { ((world - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+                world.distance(a + ab * t)
+            })
+            .fold(f32::MAX, f32::min);
+        if distance <= CABLE_DROP_RADIUS && best.map_or(true, |(_, d)| distance < d) {
+            best = Some((index, distance));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
 fn insert_candidate(model: &Model, id: u64, start: Point2) -> Option<(usize, usize)> {
     if model.selected.iter().any(|s| *s != id) || model.hidden(id) {
         return None;
@@ -3600,6 +4052,36 @@ fn insert_into_cable(model: &mut Model, id: u64, index: usize, input: usize) {
     let Connection { from, to, to_input } = model.connections.remove(index);
     model.connections.push(Connection { from, to: id, to_input: input });
     model.connections.push(Connection { from: id, to, to_input });
+}
+
+/// Modules dropped with their center inside an open group's frame join it
+/// (the frame grows to hold them). Groups that move as a whole keep theirs.
+fn join_group_under(model: &mut Model, moved: &[u64]) {
+    let mut joins: Vec<(u64, Vec<u64>)> = Vec::new();
+    for id in moved {
+        let Some(center) = model.modules.iter().find(|m| m.id == *id).map(|m| module_body_rect(m).xy()) else { continue };
+        if model.group_of(*id).is_some_and(|g| g.members.iter().all(|m| moved.contains(m))) {
+            continue;
+        }
+        let target = model.groups.iter().rev().find(|g| {
+            !g.collapsed && !g.members.contains(id) && model.group_frame(g).is_some_and(|f| f.contains(center))
+        });
+        if let Some(g) = target {
+            match joins.iter_mut().find(|(gid, _)| *gid == g.id) {
+                Some((_, ids)) => ids.push(*id),
+                None => joins.push((g.id, vec![*id])),
+            }
+        }
+    }
+    for (gid, ids) in joins {
+        for g in &mut model.groups {
+            g.members.retain(|m| !ids.contains(m));
+        }
+        if let Some(g) = model.groups.iter_mut().find(|g| g.id == gid) {
+            g.members.extend(ids);
+        }
+    }
+    model.groups.retain(|g| !g.members.is_empty());
 }
 
 /// After dropping modules, shoves any module they overlap sideways (away
@@ -3676,9 +4158,16 @@ fn draw_groups(draw: &Draw, t: &Theme, model: &Model, now: f32, hover: Option<Po
         match editing_title(model, g.id) {
             Some(typed) => {
                 ui::rounded(draw, label_rect.pad(3.0), ui::RADIUS, t.field);
-                ui::label_left(draw, label_rect, &format!("{typed}{}", if caret { "|" } else { "" }), t.field_text, 13);
+                ui::rounded_outline(draw, label_rect.pad(3.0), ui::RADIUS, t.accent, 1.5);
+                ui::label_left(draw, label_rect, &format!("  {typed}{}", if caret { "|" } else { "" }), t.field_text, 13);
             }
-            None => ui::label_left(draw, label_rect, &g.title, t.text, 13),
+            None => {
+                // Hovering the title hints that it's editable (double-click or right-click → Rename).
+                if hover.is_some_and(|m| label_rect.contains(m)) && !g.collapsed {
+                    ui::rounded_outline(draw, label_rect.pad(3.0), ui::RADIUS, t.accent, 1.0);
+                }
+                ui::label_left(draw, label_rect, &g.title, t.text, 13);
+            }
         }
 
         for (slot, button) in group::BUTTONS.iter().enumerate() {

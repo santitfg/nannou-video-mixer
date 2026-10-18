@@ -84,6 +84,8 @@ static HELD: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
 /// How long a worker may go without a frame before it's considered hung
 /// (longer before the first one: the device is still opening).
 const STALL_AFTER: Duration = Duration::from_secs(3);
+/// A preview is dimmed once its camera has been silent this long.
+const NO_SIGNAL_AFTER: Duration = Duration::from_millis(1500);
 const FIRST_FRAME_WITHIN: Duration = Duration::from_secs(10);
 
 /// Flips `alive` off when the capture thread ends, however it ends.
@@ -228,6 +230,13 @@ impl CameraWorker {
         self.last_frame_ms.load(Ordering::Relaxed) > 0
     }
 
+    /// How long since the last frame (or since the start, before the first).
+    pub fn silent_for(&self) -> Duration {
+        let age = self.started.elapsed();
+        let last = Duration::from_millis(self.last_frame_ms.load(Ordering::Relaxed));
+        age.saturating_sub(last)
+    }
+
     /// Alive but silent for too long: the grab is hung in the driver.
     pub fn stalled(&self) -> bool {
         let age = self.started.elapsed();
@@ -354,6 +363,11 @@ impl CameraState {
             failures: 0,
             retry_at: None,
         }
+    }
+
+    /// A frame hasn't arrived for a while: the preview shows stale video.
+    pub fn no_signal(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| w.silent_for() > NO_SIGNAL_AFTER)
     }
 
     pub fn label(&self, available: &[CameraInfo]) -> String {

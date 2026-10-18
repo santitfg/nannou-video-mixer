@@ -1,7 +1,7 @@
 use crate::modules::effects::shader::ShaderState;
 use crate::modules::math::{
     lag::{LagMode, LagState},
-    map::{ClampState, MapState},
+    map::MapState,
     lfo::{LfoState, Wave},
     mult::MultState,
     number::NumberState,
@@ -44,6 +44,9 @@ struct SavedModule {
     /// A Shader's file name inside the shaders folder.
     #[serde(skip_serializing_if = "Option::is_none")]
     shader_file: Option<String>,
+    /// The category a Shader's list is limited to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shader_category: Option<String>,
     /// The module's number box (Blend's mix, Number's value, LFO's
     /// frequency) with its range. Older files only have `mix`/`value`/`freq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,11 +65,16 @@ struct SavedModule {
     playing: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     position: Option<f64>,
-    /// Map's / Clamp's range fields, and Map's clamp toggle.
+    /// Map's range fields (an old Clamp saved just min and max), and its
+    /// clamp, autorange and center toggles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fields: Option<Vec<SavedParam>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     clamp: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    map_auto: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    map_center: Option<bool>,
     /// A WLED module's device (address) and the GPIO it outputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wled_device: Option<String>,
@@ -165,6 +173,31 @@ impl Snippet {
     pub fn is_empty(&self) -> bool {
         self.modules.is_empty()
     }
+
+    /// Identifies the modules, their parameters and the cables between
+    /// them, ignoring ids, positions, names and view state (previews, a
+    /// video's playhead), so two copies of the same patch match.
+    pub fn fingerprint(&self) -> String {
+        let signature = |m: &SavedModule| {
+            let mut value = serde_json::to_value(m).unwrap_or_default();
+            if let Some(map) = value.as_object_mut() {
+                for key in ["id", "pos", "minimized", "show_preview", "playing", "position"] {
+                    map.remove(key);
+                }
+            }
+            value.to_string()
+        };
+        let signatures: BTreeMap<u64, String> = self.modules.iter().map(|m| (m.id, signature(m))).collect();
+        let mut modules: Vec<&String> = signatures.values().collect();
+        modules.sort();
+        let mut cables: Vec<String> = self
+            .connections
+            .iter()
+            .filter_map(|c| Some(format!("{}>{}:{}", signatures.get(&c.from)?, signatures.get(&c.to)?, c.to_input)))
+            .collect();
+        cables.sort();
+        format!("{modules:?}|{cables:?}")
+    }
 }
 
 /// A group saved to the sidebar's personal palette.
@@ -253,6 +286,7 @@ fn save_module(m: &PlacedModule) -> SavedModule {
     let mut value = None;
     let mut freq = None;
     let mut shader_file = None;
+    let mut shader_category = None;
     let mut param = None;
     let mut shader_params = None;
     let mut wave = None;
@@ -261,6 +295,7 @@ fn save_module(m: &PlacedModule) -> SavedModule {
     let mut lag_mode = None;
     let (mut video_path, mut video_loop, mut playing, mut position) = (None, None, None, None);
     let (mut fields, mut clamp, mut wled_device, mut wled_pin) = (None, None, None, None);
+    let (mut map_auto, mut map_center) = (None, None);
     match &m.body {
         ModuleBody::Camera(cam) => {
             camera_name = cam.wanted.clone();
@@ -282,6 +317,7 @@ fn save_module(m: &PlacedModule) -> SavedModule {
         }
         ModuleBody::Shader(shader) => {
             shader_file = shader.file.clone();
+            shader_category = shader.category.clone();
             let mut tuned: BTreeMap<String, SavedParam> =
                 shader.tuned.iter().map(|(k, p)| (k.clone(), (*p).into())).collect();
             for (prop, p) in shader.props().iter().zip(&shader.params) {
@@ -292,8 +328,9 @@ fn save_module(m: &PlacedModule) -> SavedModule {
         ModuleBody::Map(map) => {
             fields = Some(map.fields.iter().map(|p| (*p).into()).collect());
             clamp = Some(map.clamp);
+            map_auto = Some(map.auto);
+            map_center = Some(map.center);
         }
-        ModuleBody::Clamp(c) => fields = Some(c.fields.iter().map(|p| (*p).into()).collect()),
         ModuleBody::Wled(w) => {
             wled_device = w.device.map(|a| a.to_string());
             wled_pin = w.pin;
@@ -323,6 +360,7 @@ fn save_module(m: &PlacedModule) -> SavedModule {
         value,
         freq,
         shader_file,
+        shader_category,
         param,
         wave,
         centered,
@@ -332,6 +370,8 @@ fn save_module(m: &PlacedModule) -> SavedModule {
         position,
         fields,
         clamp,
+        map_auto,
+        map_center,
         wled_device,
         wled_pin,
         blend_mode,
@@ -350,9 +390,13 @@ fn build_save_file(model: &Model) -> SaveFile {
 }
 
 pub fn save_composition(model: &Model) -> std::io::Result<()> {
+    save_composition_to(model, std::path::Path::new(SAVE_PATH))
+}
+
+pub fn save_composition_to(model: &Model, path: &std::path::Path) -> std::io::Result<()> {
     let file = build_save_file(model);
     let json = serde_json::to_string_pretty(&file).expect("composition is always serializable");
-    std::fs::write(SAVE_PATH, json)
+    std::fs::write(path, json)
 }
 
 /// Replaces the current composition with whatever's in `path`. Camera
@@ -427,15 +471,22 @@ fn restore_body(saved: SavedModule, cameras: &[CameraInfo]) -> ModuleBody {
         ModuleKind::Map => {
             let mut map = MapState::new();
             map.chrome = chrome;
-            restore_fields(&mut map.fields, &saved.fields);
-            map.clamp = saved.clamp.unwrap_or(false);
+            match saved.fields.as_deref() {
+                // A Clamp from before it was folded into Map: min and max only.
+                Some([min, max]) => {
+                    for (i, p) in [*min, *max, *min, *max].into_iter().enumerate() {
+                        map.fields[i] = p.restore();
+                    }
+                    map.clamp = true;
+                }
+                _ => {
+                    restore_fields(&mut map.fields, &saved.fields);
+                    map.clamp = saved.clamp.unwrap_or(false);
+                }
+            }
+            map.auto = saved.map_auto.unwrap_or(false);
+            map.center = saved.map_center.unwrap_or(false);
             ModuleBody::Map(map)
-        }
-        ModuleKind::Clamp => {
-            let mut c = ClampState::new();
-            c.chrome = chrome;
-            restore_fields(&mut c.fields, &saved.fields);
-            ModuleBody::Clamp(c)
         }
         ModuleKind::Wled => {
             let mut w = WledState::new();
@@ -471,6 +522,7 @@ fn restore_body(saved: SavedModule, cameras: &[CameraInfo]) -> ModuleBody {
             let mut shader = ShaderState::new();
             shader.chrome = chrome;
             shader.select(saved.shader_file);
+            shader.category = saved.shader_category;
             // Applied by name once the file compiles.
             shader.tuned = saved
                 .shader_params
@@ -534,6 +586,44 @@ fn finish_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snippet_of(json: &str) -> Snippet {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn fingerprint_ignores_ids_and_positions_but_not_parameters() {
+        let a = snippet_of(
+            r#"{"modules":[{"id":1,"kind":"number","pos":[0,0],"minimized":false,"show_preview":true,"value":0.5},
+                           {"id":2,"kind":"lag","pos":[300,0],"minimized":false,"show_preview":true}],
+                "connections":[{"from":1,"to":2,"to_input":0}]}"#,
+        );
+        let moved = snippet_of(
+            r#"{"modules":[{"id":9,"kind":"lag","pos":[5,5],"minimized":true,"show_preview":false},
+                           {"id":7,"kind":"number","pos":[-40,80],"minimized":false,"show_preview":true,"value":0.5}],
+                "connections":[{"from":7,"to":9,"to_input":0}]}"#,
+        );
+        let tuned = snippet_of(
+            r#"{"modules":[{"id":1,"kind":"number","pos":[0,0],"minimized":false,"show_preview":true,"value":0.7},
+                           {"id":2,"kind":"lag","pos":[300,0],"minimized":false,"show_preview":true}],
+                "connections":[{"from":1,"to":2,"to_input":0}]}"#,
+        );
+        assert_eq!(a.fingerprint(), moved.fingerprint());
+        assert_ne!(a.fingerprint(), tuned.fingerprint());
+    }
+
+    #[test]
+    fn old_clamp_loads_as_a_clamping_map() {
+        let saved: SavedModule = serde_json::from_str(
+            r#"{"id":1,"kind":"clamp","pos":[0,0],"minimized":false,"show_preview":false,
+                "fields":[{"value":0.2,"min":0,"max":1,"clamp":false},{"value":0.8,"min":0,"max":1,"clamp":false}]}"#,
+        )
+        .unwrap();
+        let ModuleBody::Map(map) = restore_body(saved, &[]) else { panic!("not a Map") };
+        assert!(map.clamp);
+        assert_eq!(map.apply(0.5), 0.5);
+        assert_eq!(map.apply(5.0), 0.8);
+    }
 
     #[test]
     fn param_survives_json() {

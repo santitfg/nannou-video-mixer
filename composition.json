@@ -1,0 +1,294 @@
+{
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 1,
+      "kind": "effect",
+      "pos": [
+        -89.11084,
+        227.82053
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "gradient_map.glsl",
+      "shader_category": "Color",
+      "shader_params": {
+        "_Mix": {
+          "value": 1.0,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Palette": {
+          "value": 2.0,
+          "min": 0.0,
+          "max": 4.0,
+          "clamp": true
+        },
+        "_Shift": {
+          "value": 0.0,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 5,
+      "kind": "generator",
+      "pos": [
+        -669.11084,
+        215.82053
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "marble.glsl",
+      "shader_category": "Generators",
+      "shader_params": {
+        "_Hue": {
+          "value": 0.0,
+          "min": 0.0,
+          "max": 6.2832,
+          "clamp": true
+        },
+        "_Scale": {
+          "value": 1.1902006,
+          "min": 0.0,
+          "max": 5.0,
+          "clamp": true
+        },
+        "_Speed": {
+          "value": 0.36222386,
+          "min": 0.0,
+          "max": 3.0,
+          "clamp": true
+        },
+        "_Veins": {
+          "value": 23.243727,
+          "min": 1.0,
+          "max": 30.0,
+          "clamp": true
+        },
+        "_Warp": {
+          "value": 0.43355957,
+          "min": 0.0,
+          "max": 4.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 8,
+      "kind": "effect",
+      "pos": [
+        490.88916,
+        239.82053
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "twirl.glsl",
+      "shader_category": "Distortion",
+      "shader_params": {
+        "_Angle": {
+          "value": -2.2105649,
+          "min": -10.0,
+          "max": 10.0,
+          "clamp": true
+        },
+        "_Radius": {
+          "value": 0.5405069,
+          "min": 0.05,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 13,
+      "kind": "effect",
+      "pos": [
+        -379.11084,
+        227.82053
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "edge_detect.glsl",
+      "shader_category": "Stylize",
+      "shader_params": {
+        "_Mix": {
+          "value": 1.0,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Mode": {
+          "value": 2.0,
+          "min": 0.0,
+          "max": 2.0,
+          "clamp": true
+        },
+        "_Strength": {
+          "value": 1.2768022,
+          "min": 0.0,
+          "max": 5.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 9,
+      "kind": "effect",
+      "pos": [
+        200.88916,
+        239.82053
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "chroma_shift.glsl",
+      "shader_category": "Glitch",
+      "shader_params": {
+        "_Amount": {
+          "value": 0.014436054,
+          "min": 0.0,
+          "max": 0.1,
+          "clamp": true
+        },
+        "_Angle": {
+          "value": 0.0,
+          "min": 0.0,
+          "max": 6.2832,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 6,
+      "kind": "effect",
+      "pos": [
+        780.88916,
+        227.82053
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "bloom.glsl",
+      "shader_category": "Blur & Glow",
+      "shader_params": {
+        "_Intensity": {
+          "value": 1.2,
+          "min": 0.0,
+          "max": 3.0,
+          "clamp": true
+        },
+        "_Radius": {
+          "value": 6.0,
+          "min": 1.0,
+          "max": 16.0,
+          "clamp": true
+        },
+        "_Threshold": {
+          "value": 0.6,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 2,
+      "kind": "effect",
+      "pos": [
+        1070.8892,
+        215.82053
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "posterize_dither.glsl",
+      "shader_category": "Color",
+      "shader_params": {
+        "_Dither": {
+          "value": 0.25221738,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Levels": {
+          "value": 2.5222294,
+          "min": 2.0,
+          "max": 8.0,
+          "clamp": true
+        },
+        "_Palette": {
+          "value": 0.0,
+          "min": 0.0,
+          "max": 4.0,
+          "clamp": true
+        },
+        "_Pixel": {
+          "value": 1.597415,
+          "min": 1.0,
+          "max": 8.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        1360.8892,
+        336.82053
+      ],
+      "minimized": false,
+      "show_preview": false
+    },
+    {
+      "id": 14,
+      "kind": "camera",
+      "pos": [
+        -631.9351,
+        -120.34921
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "FaceCam 1000X: FaceCam 1000X"
+    }
+  ],
+  "connections": [
+    {
+      "from": 13,
+      "to": 1,
+      "to_input": 0
+    },
+    {
+      "from": 1,
+      "to": 9,
+      "to_input": 0
+    },
+    {
+      "from": 9,
+      "to": 8,
+      "to_input": 0
+    },
+    {
+      "from": 8,
+      "to": 6,
+      "to_input": 0
+    },
+    {
+      "from": 6,
+      "to": 2,
+      "to_input": 0
+    },
+    {
+      "from": 2,
+      "to": 0,
+      "to_input": 0
+    },
+    {
+      "from": 14,
+      "to": 13,
+      "to_input": 0
+    }
+  ],
+  "groups": []
+}

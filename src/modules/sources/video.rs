@@ -650,6 +650,11 @@ pub struct VideoState {
 }
 
 impl VideoState {
+    /// The decoder died (a retry is pending): the preview shows stale video.
+    pub fn no_signal(&self) -> bool {
+        self.path.is_some() && self.worker.as_ref().map_or(self.retry_at.is_some(), |w| !w.is_alive())
+    }
+
     pub fn new() -> Self {
         VideoState {
             chrome: ModuleChrome::new(),

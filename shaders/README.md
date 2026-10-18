@@ -66,9 +66,9 @@ if (_Mode == 1) { ... }
 
 ## Sidebar
 
-Every shader is listed in the sidebar under **Effects**, grouped by its
-`@category`. Adding one creates a node of the matching role with that file
-loaded; the node's own dropdown lists the other shaders of the same role.
+The sidebar's **Effects** list has one entry per `@category` (and role).
+Adding one creates a node of that role whose dropdown lists only the
+shaders of that category; pick the shader there.
 
 ## Limitations
 

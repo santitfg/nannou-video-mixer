@@ -21,6 +21,9 @@ pub struct ShaderState {
     pub chrome: ModuleChrome,
     /// File name inside the shaders folder.
     pub file: Option<String>,
+    /// Limits the list to one category (the node came from the sidebar's
+    /// category entry). `None` lists every shader of the node's role.
+    pub category: Option<String>,
     pub dropdown_open: bool,
     /// The `Enum` property whose options dropdown is open.
     pub prop_dropdown: Option<usize>,
@@ -44,6 +47,7 @@ impl ShaderState {
         ShaderState {
             chrome: ModuleChrome::new(),
             file: None,
+            category: None,
             dropdown_open: false,
             prop_dropdown: None,
             compiled: None,

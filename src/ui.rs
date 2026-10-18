@@ -100,7 +100,6 @@ impl Theme {
             | ModuleKind::Lfo
             | ModuleKind::Lag
             | ModuleKind::Map
-            | ModuleKind::Clamp
             | ModuleKind::Wled => self.math,
         }
     }

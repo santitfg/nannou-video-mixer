@@ -11,7 +11,7 @@ use effects::shader_file::ShaderRole;
 use math::{
     lag::LagState,
     lfo::LfoState,
-    map::{ClampState, MapState},
+    map::MapState,
     mult::MultState,
     number::NumberState,
 };
@@ -43,8 +43,9 @@ pub enum ModuleKind {
     Mult,
     Lfo,
     Lag,
+    /// Old compositions saved Clamp as its own kind: it loads as a Map.
+    #[serde(alias = "clamp")]
     Map,
-    Clamp,
     Wled,
     /// Legacy catch-all shader node (lists every shader); kept so old
     /// compositions load. New nodes use the role-specific kinds below.
@@ -103,7 +104,6 @@ pub const CATEGORIES: &[(&str, &[(&str, ModuleKind)])] = &[
             ("LFO", ModuleKind::Lfo),
             ("Lag", ModuleKind::Lag),
             ("Map", ModuleKind::Map),
-            ("Clamp", ModuleKind::Clamp),
         ],
     ),
     // Filled from the shaders folder, by category: see `sidebar_rows`.
@@ -129,7 +129,6 @@ pub fn kind_label(kind: ModuleKind) -> &'static str {
         ModuleKind::Lfo => "LFO",
         ModuleKind::Lag => "Lag",
         ModuleKind::Map => "Map",
-        ModuleKind::Clamp => "Clamp",
         ModuleKind::Wled => "WLED",
         ModuleKind::Shader => "Shader",
         ModuleKind::Generator => "Generator",
@@ -155,7 +154,7 @@ pub fn input_types(kind: ModuleKind) -> &'static [PortType] {
         ModuleKind::Blend => &[PortType::Video, PortType::Video, PortType::Number],
         ModuleKind::Output => &[PortType::Video],
         ModuleKind::Mult => &[PortType::Number, PortType::Number],
-        ModuleKind::Lag | ModuleKind::Map | ModuleKind::Clamp => &[PortType::Number],
+        ModuleKind::Lag | ModuleKind::Map => &[PortType::Number],
         ModuleKind::Wled => &[],
         // Speed, then scrub (a wired scrub drives the playhead directly).
         ModuleKind::Video => &[PortType::Number, PortType::Number],
@@ -179,7 +178,6 @@ pub fn output_type(kind: ModuleKind) -> Option<PortType> {
         | ModuleKind::Lfo
         | ModuleKind::Lag
         | ModuleKind::Map
-        | ModuleKind::Clamp
         | ModuleKind::Wled => Some(PortType::Number),
     }
 }
@@ -204,7 +202,6 @@ pub fn has_config_row(kind: ModuleKind) -> bool {
         | ModuleKind::Lfo
         | ModuleKind::Lag
         | ModuleKind::Map
-        | ModuleKind::Clamp
         | ModuleKind::Wled
         | ModuleKind::Mult
         | ModuleKind::Shader
@@ -226,9 +223,8 @@ pub fn base_height(kind: ModuleKind) -> f32 {
         ModuleKind::Lfo | ModuleKind::Blend | ModuleKind::Lag => 126.0,
         // File, speed, transport and the scrub bar.
         ModuleKind::Video => 180.0,
-        // Two rows of range fields, then the clamp toggle and readout.
-        ModuleKind::Map => 126.0,
-        ModuleKind::Clamp => 126.0,
+        // Two rows of range fields, bias and calibrate, the toggles, the readout.
+        ModuleKind::Map => 198.0,
         // Grows with its inputs: see `PlacedModule::base_height`.
         ModuleKind::Wled => WLED_ROWS_TOP + 40.0,
         _ if has_config_row(kind) => 90.0,
@@ -264,7 +260,6 @@ pub enum ModuleBody {
     Lfo(LfoState),
     Lag(LagState),
     Map(MapState),
-    Clamp(ClampState),
     Wled(WledState),
     Shader(ShaderState),
 }
@@ -281,7 +276,6 @@ impl ModuleBody {
             ModuleBody::Lfo(s) => &s.chrome,
             ModuleBody::Lag(s) => &s.chrome,
             ModuleBody::Map(s) => &s.chrome,
-            ModuleBody::Clamp(s) => &s.chrome,
             ModuleBody::Wled(s) => &s.chrome,
             ModuleBody::Shader(s) => &s.chrome,
         }
@@ -298,7 +292,6 @@ impl ModuleBody {
             ModuleBody::Lfo(s) => &mut s.chrome,
             ModuleBody::Lag(s) => &mut s.chrome,
             ModuleBody::Map(s) => &mut s.chrome,
-            ModuleBody::Clamp(s) => &mut s.chrome,
             ModuleBody::Wled(s) => &mut s.chrome,
             ModuleBody::Shader(s) => &mut s.chrome,
         }
@@ -361,7 +354,6 @@ pub fn push_module(modules: &mut Vec<PlacedModule>, next_id: &mut u64, kind: Mod
         ModuleKind::Lfo => ModuleBody::Lfo(LfoState::new()),
         ModuleKind::Lag => ModuleBody::Lag(LagState::new()),
         ModuleKind::Map => ModuleBody::Map(MapState::new()),
-        ModuleKind::Clamp => ModuleBody::Clamp(ClampState::new()),
         ModuleKind::Wled => ModuleBody::Wled(WledState::new()),
         ModuleKind::Shader | ModuleKind::Generator | ModuleKind::Effect | ModuleKind::Feedback | ModuleKind::ShaderMix => {
             ModuleBody::Shader(ShaderState::new())
@@ -406,9 +398,6 @@ pub fn module_number(
         ModuleBody::Map(map) => input_source(connections, id, 0)
             .and_then(|src| module_number(modules, connections, src, now, visiting))
             .map(|x| map.apply(x)),
-        ModuleBody::Clamp(clamp) => input_source(connections, id, 0)
-            .and_then(|src| module_number(modules, connections, src, now, visiting))
-            .map(|x| clamp.apply(x)),
         // Refreshed from the device every tick in `update`.
         ModuleBody::Wled(wled) => wled.output(),
         ModuleBody::Mult(_) => {

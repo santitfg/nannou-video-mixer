@@ -107,7 +107,6 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
             | ModuleBody::Lfo(_)
             | ModuleBody::Lag(_)
             | ModuleBody::Map(_)
-            | ModuleBody::Clamp(_)
             | ModuleBody::Wled(_) => None,
         };
 

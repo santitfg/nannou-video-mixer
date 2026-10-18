@@ -17,9 +17,14 @@ pub struct Settings {
     /// Show an Exit button (and the cursor) when the mouse moves in
     /// fullscreen. Off: fullscreen stays clean; leave with a click or key.
     pub show_exit_button: bool,
+    /// Project mode: Save asks where and under what name to save (and
+    /// remembers the project). Off, sample mode: Save overwrites `composition.json`.
+    pub project_mode: bool,
+    /// Reopen the last session (autosaved on exit) when the app starts.
+    pub restore_session: bool,
+    /// Start in fullscreen output.
+    pub start_fullscreen: bool,
     pub palette: Palette,
-    /// Shader files pinned to the sidebar (Effects), in pin order.
-    pub favorite_shaders: Vec<String>,
     /// WLED controllers to reconnect to on start (found by a scan or added by IP).
     pub wled_devices: Vec<WledDevice>,
     /// How often each WLED controller is polled.
@@ -52,8 +57,10 @@ impl Default for Settings {
             drag_speed: 1.0,
             show_fps: false,
             show_exit_button: false,
+            project_mode: false,
+            restore_session: false,
+            start_fullscreen: false,
             palette: Palette::Dark,
-            favorite_shaders: Vec::new(),
             wled_devices: Vec::new(),
             wled_poll_ms: 50,
             debug_log: false,
@@ -75,10 +82,22 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    /// Serializes now and writes on a background thread (one writer, so
+    /// saves land in order), keeping the disk off the render loop.
     pub fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(SETTINGS_PATH, json);
-        }
+        use std::sync::{mpsc, OnceLock};
+        static WRITER: OnceLock<mpsc::Sender<String>> = OnceLock::new();
+        let Ok(json) = serde_json::to_string_pretty(self) else { return };
+        let writer = WRITER.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                for json in rx {
+                    let _ = std::fs::write(SETTINGS_PATH, json);
+                }
+            });
+            tx
+        });
+        let _ = writer.send(json);
     }
 
     /// Pushes the settings that live outside `Model` (the debug log and

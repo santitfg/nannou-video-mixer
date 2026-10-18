@@ -87,7 +87,7 @@ Builds Linux and Windows, and macOS if osxcross is available; otherwise skips it
 | Add a module | Click its row in the sidebar (scroll the sidebar with the wheel) |
 | Select | Click a module; Shift+click adds/removes; drag on empty canvas for a rectangle (Cmd/Ctrl or Shift adds) |
 | Move | Drag a module (moves the whole selection) or a group's title bar |
-| Pan / zoom | Wheel or two-finger scroll, middle-drag, Shift+drag on empty canvas / Cmd/Ctrl+wheel, pinch, `+` `-` `0`; `H` recenters |
+| Pan / zoom | Mouse wheel zooms at the cursor (Shift+wheel pans sideways); two-finger scroll pans (Cmd/Ctrl+scroll or pinch zooms); middle-drag or Shift+drag on empty canvas pans; `+` `-` `0` zoom; `H` recenters |
 | Number box | Drag to adjust (Shift = fine), click to type, right-click for range / clamp |
 | Copy / cut / paste | Cmd/Ctrl + `C` / `X` / `V` (pastes under the mouse) |
 | Duplicate | `D` or Cmd/Ctrl+`D` |
