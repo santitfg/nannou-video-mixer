@@ -1,0 +1,26 @@
+{
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        0.0,
+        95.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    },
+    {
+      "id": 1,
+      "kind": "wled",
+      "pos": [
+        0.0,
+        -110.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    }
+  ],
+  "connections": []
+}

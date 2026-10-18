@@ -4,20 +4,30 @@
     {
       "id": 0,
       "kind": "output",
-      "pos": [150.0, 0.0],
+      "pos": [
+        340.0,
+        0.0
+      ],
       "minimized": false,
       "show_preview": true
     },
     {
       "id": 1,
       "kind": "camera",
-      "pos": [-150.0, 0.0],
+      "pos": [
+        0.0,
+        0.0
+      ],
       "minimized": false,
-      "show_preview": false,
+      "show_preview": true,
       "camera_name": "Integrated Webcam HD"
     }
   ],
   "connections": [
-    { "from": 1, "to": 0, "to_input": 0 }
+    {
+      "from": 1,
+      "to": 0,
+      "to_input": 0
+    }
   ]
 }

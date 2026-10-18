@@ -1,0 +1,32 @@
+{
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        340.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    },
+    {
+      "id": 1,
+      "kind": "video",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    }
+  ],
+  "connections": [
+    {
+      "from": 1,
+      "to": 0,
+      "to_input": 0
+    }
+  ]
+}

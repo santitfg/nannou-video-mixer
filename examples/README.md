@@ -32,7 +32,14 @@ directly with the **Load** button, which opens a native file picker.
 
 ## Files
 
-- `single-camera.json` — one camera wired straight into Output.
-- `two-cameras-blend-50-50.json` — two cameras ("Integrated Webcam HD" and
-  "Razer Kiyo") each wired into one of a Blend module's two inputs, mix set
-  to `0.5` (even split), Blend wired into Output.
+The examples are compiled into the program (`build.rs` embeds every `.json`
+in `boxes/` and `compositions/`), so they show up in the sidebar's
+**Examples** tab and cannot be edited from the app: adding one always puts a
+copy on the canvas. Add or change a file here and rebuild to update them.
+
+- `boxes/` — one small patch per module and per shader category, each
+  working on its own (generators stand in for a camera). Clicking one adds
+  it to the canvas and plugs it into the Output if that has no input yet.
+- `compositions/` — whole patches. Clicking one replaces the canvas.
+  `single-camera`, `two-cameras-blend-50-50` and `camera-shader-lfo` use
+  camera names from the author's machine; they load unselected elsewhere.

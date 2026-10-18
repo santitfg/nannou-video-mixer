@@ -8,7 +8,7 @@
 use crate::modules::effects::shader::compile_pending;
 use crate::modules::sources::camera::CameraState;
 use crate::modules::sources::video::VideoState;
-use crate::modules::{input_source, module_number, reaches, Connection, ModuleBody, PlacedModule};
+use crate::modules::{input_source, multi_input, ModuleKind, module_number, reaches, Connection, ModuleBody, PlacedModule};
 use crate::gpu::VideoTex;
 use crate::Model;
 use nannou::prelude::*;
@@ -81,6 +81,15 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
         let produced = match &model.modules[idx].body {
             ModuleBody::Camera(_) | ModuleBody::Video(_) => None, // handled below, needs &mut
             ModuleBody::Output(_) => video_in(&results, 0),
+            ModuleBody::Blend(blend) if model.modules[idx].kind == ModuleKind::Stack => {
+                let layers: Vec<VideoTex> = multi_input::sources(&model.connections, id, 0)
+                    .into_iter()
+                    .filter_map(|src| results.get(&src).cloned())
+                    .collect();
+                let mix = blend.mix.resolve(number_in(&model.modules, 1));
+                let ModuleBody::Blend(blend) = &mut model.modules[idx].body else { unreachable!() };
+                blend.record_stack(&model.blend_pipeline, device, queue, &mut encoder, layers, mix)
+            }
             ModuleBody::Blend(blend) => {
                 let a = video_in(&results, 0);
                 let b = video_in(&results, 1);
@@ -107,7 +116,8 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
             | ModuleBody::Lfo(_)
             | ModuleBody::Lag(_)
             | ModuleBody::Map(_)
-            | ModuleBody::Wled(_) => None,
+            | ModuleBody::Wled(_)
+            | ModuleBody::Osc(_) => None,
         };
 
         let produced = match &mut model.modules[idx].body {

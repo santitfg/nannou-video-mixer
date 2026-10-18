@@ -4,38 +4,62 @@
     {
       "id": 0,
       "kind": "output",
-      "pos": [280.0, 0.0],
+      "pos": [
+        680.0,
+        0.0
+      ],
       "minimized": false,
       "show_preview": true
     },
     {
       "id": 1,
       "kind": "blend",
-      "pos": [0.0, 0.0],
+      "pos": [
+        340.0,
+        0.0
+      ],
       "minimized": false,
-      "show_preview": false,
+      "show_preview": true,
       "mix": 0.5
     },
     {
       "id": 2,
       "kind": "camera",
-      "pos": [-280.0, 120.0],
+      "pos": [
+        0.0,
+        145.0
+      ],
       "minimized": false,
-      "show_preview": false,
+      "show_preview": true,
       "camera_name": "Integrated Webcam HD"
     },
     {
       "id": 3,
       "kind": "camera",
-      "pos": [-280.0, -120.0],
+      "pos": [
+        0.0,
+        -145.0
+      ],
       "minimized": false,
-      "show_preview": false,
+      "show_preview": true,
       "camera_name": "Razer Kiyo"
     }
   ],
   "connections": [
-    { "from": 2, "to": 1, "to_input": 0 },
-    { "from": 3, "to": 1, "to_input": 1 },
-    { "from": 1, "to": 0, "to_input": 0 }
+    {
+      "from": 2,
+      "to": 1,
+      "to_input": 0
+    },
+    {
+      "from": 3,
+      "to": 1,
+      "to_input": 1
+    },
+    {
+      "from": 1,
+      "to": 0,
+      "to_input": 0
+    }
   ]
 }

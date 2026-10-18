@@ -60,7 +60,7 @@ impl Default for Settings {
             project_mode: false,
             restore_session: false,
             start_fullscreen: false,
-            palette: Palette::Dark,
+            palette: Palette::Midnight,
             wled_devices: Vec::new(),
             wled_poll_ms: 50,
             debug_log: false,

@@ -1,0 +1,65 @@
+{
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        680.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    },
+    {
+      "id": 1,
+      "kind": "camera",
+      "pos": [
+        0.0,
+        90.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "Integrated Webcam HD"
+    },
+    {
+      "id": 2,
+      "kind": "shader",
+      "pos": [
+        340.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "chroma_shift.glsl"
+    },
+    {
+      "id": 3,
+      "kind": "lfo",
+      "pos": [
+        0.0,
+        -145.0
+      ],
+      "minimized": false,
+      "show_preview": false,
+      "freq": 0.25
+    }
+  ],
+  "connections": [
+    {
+      "from": 1,
+      "to": 2,
+      "to_input": 0
+    },
+    {
+      "from": 3,
+      "to": 2,
+      "to_input": 1
+    },
+    {
+      "from": 2,
+      "to": 0,
+      "to_input": 0
+    }
+  ]
+}

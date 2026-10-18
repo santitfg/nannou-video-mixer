@@ -1,8 +1,10 @@
 mod debug_log;
+mod examples;
 mod gpu;
 mod graph;
 mod group;
 mod modules;
+mod project;
 mod save;
 mod settings;
 mod sync;
@@ -16,7 +18,7 @@ use modules::param::Param;
 use modules::sources::camera::{discover_cameras, CameraWatcher, CameraWorker};
 use modules::sources::video::{fmt_time, LoopMode, VideoState, VideoWorker};
 use modules::sources::wled::{short_name, Link, WledState};
-use modules::{WLED_ROWS_TOP, WLED_ROW_H};
+use modules::{multi_input, WLED_ROWS_TOP, WLED_ROW_H};
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use wled_pots::{DeviceDiscovery, DiscoveredDevice, MdnsDiscovery, WledManager};
@@ -46,6 +48,8 @@ const PORT_RADIUS: f32 = 9.0;
 const PORT_HIT_RADIUS: f32 = 18.0;
 const SIDEBAR_WIDTH: f32 = 220.0;
 const SIDEBAR_HEADER_H: f32 = 64.0;
+/// The Modules / Examples tab strip under the Save and Load buttons.
+const SIDEBAR_TABS_H: f32 = 36.0;
 const MODULE_W: f32 = 220.0;
 const MODULE_RADIUS: f32 = 10.0;
 /// An `update` slower than this is logged (Settings → Debug).
@@ -126,6 +130,8 @@ enum EditField {
 enum EditTarget {
     Param(ParamTarget, EditField),
     GroupTitle(u64),
+    /// A project tab's name (index into `tabs`).
+    TabName(usize),
     /// A saved group's name in the sidebar (index into `presets`).
     PresetName(usize),
     /// The WLED panel's "add by IP / host name" field.
@@ -135,8 +141,101 @@ enum EditTarget {
 struct TextEdit {
     target: EditTarget,
     buffer: String,
-    /// The buffer still holds the old value: the first keystroke replaces it.
-    fresh: bool,
+    /// Where typing lands, in characters from the start of `buffer`.
+    cursor: usize,
+    /// The other end of the selection (the caret is the first): the
+    /// characters between them are replaced by whatever is typed.
+    anchor: Option<usize>,
+}
+
+impl TextEdit {
+    /// Starts editing `buffer` with the caret at its end; `select_all`
+    /// selects it so the first keystroke replaces it.
+    fn new(target: EditTarget, buffer: String, select_all: bool) -> Self {
+        let cursor = buffer.chars().count();
+        TextEdit { target, buffer, cursor, anchor: select_all.then_some(0) }
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    fn byte_at(&self, chars: usize) -> usize {
+        self.buffer.char_indices().nth(chars).map_or(self.buffer.len(), |(i, _)| i)
+    }
+
+    /// The selected range, in characters, if any.
+    fn selection(&self) -> Option<(usize, usize)> {
+        self.anchor.filter(|a| *a != self.cursor).map(|a| (a.min(self.cursor), a.max(self.cursor)))
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        let (from, to) = (self.byte_at(a), self.byte_at(b));
+        self.buffer.replace_range(from..to, "");
+        self.cursor = a;
+        self.anchor = None;
+        true
+    }
+
+    fn insert(&mut self, ch: char) {
+        self.delete_selection();
+        let at = self.byte_at(self.cursor);
+        self.buffer.insert(at, ch);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if !self.delete_selection() && self.cursor > 0 {
+            let at = self.byte_at(self.cursor - 1);
+            self.buffer.remove(at);
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        if !self.delete_selection() && self.cursor < self.len() {
+            let at = self.byte_at(self.cursor);
+            self.buffer.remove(at);
+        }
+    }
+
+    /// Moves the caret; `extend` (Shift) grows the selection instead of dropping it.
+    fn move_cursor(&mut self, to: usize, extend: bool) {
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = to.min(self.len());
+    }
+
+    /// Left/Right without Shift: a selection collapses to its near edge.
+    fn step(&mut self, delta: isize, extend: bool) {
+        match (self.selection(), extend) {
+            (Some((a, b)), false) => self.move_cursor(if delta < 0 { a } else { b }, false),
+            _ => self.move_cursor(self.cursor.saturating_add_signed(delta), extend),
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.selection()?;
+        Some(self.buffer.chars().skip(a).take(b - a).collect())
+    }
+
+    fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.len();
+    }
+
+    /// A click: caret here, selection starts here (a drag extends it).
+    fn click_at(&mut self, at: usize) {
+        self.cursor = at.min(self.len());
+        self.anchor = Some(self.cursor);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -159,6 +258,8 @@ enum Drag {
     Group { id: u64, last: Point2 },
     /// Scrubbing a video's position bar.
     Scrub { id: u64 },
+    /// Dragging across the text being edited to select part of it.
+    TextSelect,
 }
 
 enum SidebarRow {
@@ -188,6 +289,8 @@ enum SidebarAction {
     ShaderCategory { category: String, role: ShaderRole },
     /// A saved group from the personal palette, by index into `presets`.
     Preset(usize),
+    /// A bundled example, by index into `Model::examples`.
+    Example(usize),
 }
 
 pub struct Model {
@@ -214,6 +317,7 @@ pub struct Model {
     zoom_changed: Option<Instant>,
     settings: Settings,
     settings_open: bool,
+    help_open: bool,
     /// The hidden Debug section of the settings panel is expanded.
     debug_open: bool,
     palette_open: bool,
@@ -227,13 +331,22 @@ pub struct Model {
     clipboard: Option<Snippet>,
     /// The personal palette: saved groups, shown in the sidebar.
     presets: Vec<Preset>,
+    /// Open projects as tabs; the active one's data is in the fields above.
+    tabs: Vec<project::ProjectTab>,
+    active_tab: usize,
     sidebar_scroll: f32,
+    /// The sidebar shows the bundled examples instead of the module list.
+    examples_tab: bool,
+    /// Bundled and read-only: adding one to the canvas copies it.
+    examples: Vec<examples::Example>,
     /// First visible row of the open module dropdown (fractional while scrolling).
     dropdown_scroll: f32,
     /// Right-click menu on the canvas, at this screen position.
     canvas_menu: Option<Point2>,
     /// Right-click menu on a saved group (sidebar) or a group frame (canvas).
     item_menu: Option<ItemMenu>,
+    /// The Stack whose layer order is being edited, and where its menu sits.
+    stack_menu: Option<StackMenu>,
     /// WLED controllers: discovery + one poller thread each.
     wled: WledManager,
     wled_open: bool,
@@ -254,6 +367,8 @@ pub struct Model {
     pub(crate) timings: Timings,
     /// Time spent in `view` since the last `update` (`view` only gets `&Model`).
     view_time: Cell<Duration>,
+    /// Start-in-fullscreen is applied on the first update tick.
+    fullscreen_pending: bool,
 }
 
 impl Model {
@@ -415,6 +530,7 @@ fn model(app: &App) -> Model {
         zoom_changed: None,
         settings: settings.clone(),
         settings_open: false,
+        help_open: false,
         debug_open: false,
         palette_open: false,
         param_menu: None,
@@ -424,10 +540,15 @@ fn model(app: &App) -> Model {
         next_group_id: 0,
         clipboard: None,
         presets: save::load_presets(),
+        tabs: vec![project::ProjectTab::new("Untitled")],
+        active_tab: 0,
         sidebar_scroll: 0.0,
+        examples_tab: false,
+        examples: examples::all(),
         dropdown_scroll: 0.0,
         canvas_menu: None,
         item_menu: None,
+        stack_menu: None,
         wled: start_wled(&settings),
         wled_open: false,
         wled_found: mpsc::channel(),
@@ -442,6 +563,7 @@ fn model(app: &App) -> Model {
         fps: FpsCounter::new(),
         timings: Timings::new(),
         view_time: Cell::new(Duration::ZERO),
+        fullscreen_pending: false,
     };
     model.output_id = push_module(&mut model, ModuleKind::Output, canvas.xy());
     if model.settings.restore_session && std::path::Path::new(SESSION_PATH).exists() {
@@ -450,9 +572,9 @@ fn model(app: &App) -> Model {
             Err(err) => model.status = Some((format!("Couldn't reopen the last session: {err}"), true, Instant::now())),
         }
     }
-    if model.settings.start_fullscreen {
-        enter_fullscreen(app, &mut model);
-    }
+    // Asking for fullscreen before the event loop runs leaves the window at
+    // its default size, so it's done on the first update instead.
+    model.fullscreen_pending = model.settings.start_fullscreen;
     model
 }
 
@@ -470,6 +592,11 @@ fn camera_names(cameras: &[CameraInfo]) -> String {
 fn update(app: &App, model: &mut Model, update: Update) {
     let started = Instant::now();
     model.fps.tick();
+
+    if model.fullscreen_pending {
+        model.fullscreen_pending = false;
+        enter_fullscreen(app, model);
+    }
 
     if model.view == View::FullscreenOverlay
         && !model.mouse_down
@@ -579,6 +706,7 @@ fn update(app: &App, model: &mut Model, update: Update) {
     step_maps(app, model);
     step_videos(app, model, update.since_last.as_secs_f64());
     step_wled(model);
+    step_osc(model);
     graph::run_graph(app, model, update.since_last.as_secs_f32());
 
     let timings = &mut model.timings;
@@ -678,6 +806,15 @@ fn add_wled_address(model: &mut Model, text: &str) {
             .unwrap_or_default();
         let _ = tx.send(found);
     });
+}
+
+/// Reads the sockets of the OSC modules.
+fn step_osc(model: &mut Model) {
+    for m in &mut model.modules {
+        if let ModuleBody::Osc(osc) = &mut m.body {
+            osc.poll();
+        }
+    }
 }
 
 /// Moves every video's playhead (speed and scrub can come from cables).
@@ -788,20 +925,8 @@ fn event(app: &App, model: &mut Model, event: Event) {
         }
         WindowEvent::ReceivedCharacter(ch) => {
             if let Some(edit) = &mut model.editing {
-                let accepted = match edit.target {
-                    EditTarget::Param(..) => {
-                        let ch = if ch == ',' { '.' } else { ch };
-                        (ch.is_ascii_digit() || ch == '.' || ch == '-').then_some(ch)
-                    }
-                    EditTarget::GroupTitle(_) | EditTarget::PresetName(_) => (!ch.is_control()).then_some(ch),
-                    EditTarget::WledAddress => (ch.is_ascii_alphanumeric() || ".:-_".contains(ch)).then_some(ch),
-                };
-                if let Some(ch) = accepted {
-                    if edit.fresh {
-                        edit.buffer.clear();
-                        edit.fresh = false;
-                    }
-                    edit.buffer.push(ch);
+                if let Some(ch) = accepted_char(edit.target, ch) {
+                    edit.insert(ch);
                 }
             }
         }
@@ -873,6 +998,13 @@ fn mouse_moved(app: &App, model: &mut Model, screen_pos: Point2) {
             let t = slider_value_at(settings_slider_rect(app.window_rect(), index), screen_pos.x);
             set_setting(&mut model.settings, index, t);
         }
+        Some(Drag::TextSelect) => {
+            if let Some(at) = caret_for_pointer(model, app.window_rect(), screen_pos, false) {
+                if let Some(edit) = model.editing.as_mut() {
+                    edit.cursor = at.min(edit.len());
+                }
+            }
+        }
         Some(Drag::Pan { last }) => {
             model.pan += (screen_pos - last) * model.settings.drag_speed;
             model.dragging = Some(Drag::Pan { last: screen_pos });
@@ -919,19 +1051,56 @@ fn mouse_moved(app: &App, model: &mut Model, screen_pos: Point2) {
     }
 }
 
+/// The character a text field of this kind takes for `ch`, if any.
+fn accepted_char(target: EditTarget, ch: char) -> Option<char> {
+    match target {
+        EditTarget::Param(..) => {
+            let ch = if ch == ',' { '.' } else { ch };
+            (ch.is_ascii_digit() || ch == '.' || ch == '-').then_some(ch)
+        }
+        EditTarget::GroupTitle(_) | EditTarget::PresetName(_) | EditTarget::TabName(_) => (!ch.is_control()).then_some(ch),
+        EditTarget::WledAddress => (ch.is_ascii_alphanumeric() || ".:-_".contains(ch)).then_some(ch),
+    }
+}
+
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+fn set_clipboard_text(text: String) {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text);
+    }
+}
+
 fn key_pressed(app: &App, model: &mut Model, key: Key) {
     // Typing into a box swallows every key.
     if model.editing.is_some() {
         match key {
             Key::Return | Key::NumpadEnter | Key::Tab => commit_edit(model),
             Key::Escape => model.editing = None,
-            Key::Back | Key::Delete => {
+            Key::Back => model.editing.as_mut().unwrap().backspace(),
+            Key::Delete => model.editing.as_mut().unwrap().delete(),
+            Key::Left => model.editing.as_mut().unwrap().step(-1, app.keys.mods.shift()),
+            Key::Right => model.editing.as_mut().unwrap().step(1, app.keys.mods.shift()),
+            Key::Home => model.editing.as_mut().unwrap().move_cursor(0, app.keys.mods.shift()),
+            Key::End => model.editing.as_mut().unwrap().move_cursor(usize::MAX, app.keys.mods.shift()),
+            Key::A if app.keys.mods.logo() || app.keys.mods.ctrl() => model.editing.as_mut().unwrap().select_all(),
+            Key::C | Key::X if app.keys.mods.logo() || app.keys.mods.ctrl() => {
                 let edit = model.editing.as_mut().unwrap();
-                if edit.fresh {
-                    edit.buffer.clear();
-                    edit.fresh = false;
-                } else {
-                    edit.buffer.pop();
+                if let Some(text) = edit.selected_text() {
+                    set_clipboard_text(text);
+                    if key == Key::X {
+                        edit.delete_selection();
+                    }
+                }
+            }
+            Key::V if app.keys.mods.logo() || app.keys.mods.ctrl() => {
+                if let (Some(text), Some(edit)) = (clipboard_text(), model.editing.as_mut()) {
+                    let target = edit.target;
+                    for ch in text.chars().filter_map(|c| accepted_char(target, c)) {
+                        edit.insert(ch);
+                    }
                 }
             }
             _ => {}
@@ -983,8 +1152,11 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
         Key::Key0 | Key::Numpad0 => zoom_at(model, canvas_center, 1.0 / model.zoom),
         Key::Equals | Key::Plus | Key::NumpadAdd => zoom_at(model, canvas_center, ZOOM_KEY_STEP),
         Key::Minus | Key::NumpadSubtract => zoom_at(model, canvas_center, 1.0 / ZOOM_KEY_STEP),
+        Key::F1 => model.help_open = !model.help_open,
         Key::Escape => {
-            if popup_open(model) {
+            if model.help_open {
+                model.help_open = false;
+            } else if popup_open(model) {
                 close_popups(model);
             } else {
                 model.selected.clear();
@@ -999,6 +1171,7 @@ fn close_popups(model: &mut Model) {
     model.palette_open = false;
     model.canvas_menu = None;
     model.item_menu = None;
+    model.stack_menu = None;
     model.dropdown_scroll = 0.0;
     for module in &mut model.modules {
         match &mut module.body {
@@ -1069,6 +1242,7 @@ fn param_slots(module: &PlacedModule) -> Vec<Slot> {
         ModuleBody::Shader(s) => (0..s.params.len()).map(Slot::Prop).collect(),
         ModuleBody::Map(m) => (0..m.fields.len()).map(Slot::Field).collect(),
         ModuleBody::Wled(_) => vec![Slot::Field(0)],
+        ModuleBody::Osc(o) => (0..o.fields.len()).map(Slot::Field).collect(),
         _ => Vec::new(),
     }
 }
@@ -1083,6 +1257,7 @@ fn param_of(module: &PlacedModule, slot: Slot) -> Option<Param> {
         (ModuleBody::Shader(s), Slot::Prop(i)) => s.params.get(i).copied(),
         (ModuleBody::Map(m), Slot::Field(i)) => m.fields.get(i).copied(),
         (ModuleBody::Wled(w), Slot::Field(0)) => Some(w.raw_max),
+        (ModuleBody::Osc(o), Slot::Field(i)) => o.fields.get(i).copied(),
         _ => None,
     }
 }
@@ -1098,6 +1273,7 @@ fn edit_param(model: &mut Model, target: ParamTarget, f: impl FnOnce(&mut Param)
         (ModuleBody::Video(v), Slot::Main) => f(&mut v.speed),
         (ModuleBody::Map(m), Slot::Field(i)) if i < m.fields.len() => f(&mut m.fields[i]),
         (ModuleBody::Wled(w), Slot::Field(0)) => f(&mut w.raw_max),
+        (ModuleBody::Osc(o), Slot::Field(i)) if i < o.fields.len() => f(&mut o.fields[i]),
         (ModuleBody::Shader(s), Slot::Prop(i)) => {
             if let Some(p) = s.params.get_mut(i) {
                 f(p);
@@ -1111,7 +1287,8 @@ fn edit_param(model: &mut Model, target: ParamTarget, f: impl FnOnce(&mut Param)
 /// The input port feeding a number box, if it has one.
 fn param_input(module: &PlacedModule, slot: Slot) -> Option<usize> {
     match (&module.body, slot) {
-        (ModuleBody::Blend(_), Slot::Main) => Some(2),
+        // A Stack has no second layer port: its mix input follows the layers.
+        (ModuleBody::Blend(_), Slot::Main) => Some(if module.kind == ModuleKind::Stack { 1 } else { 2 }),
         (ModuleBody::Video(_), Slot::Main) => Some(0),
         (ModuleBody::Shader(s), Slot::Prop(i)) => Some(s.channels() + i),
         _ => None,
@@ -1163,6 +1340,8 @@ fn param_view(model: &Model, module: &PlacedModule, slot: Slot, now: f32) -> Opt
         (ModuleBody::Video(_), _) => format!("Speed {}\u{00D7}{suffix}", fmt_num(shown)),
         (ModuleBody::Map(_), Slot::Field(i)) => format!("{} {}", modules::math::map::MAP_LABELS[i], fmt_num(shown)),
         (ModuleBody::Wled(_), _) => format!("Raw max {:.0}", shown),
+        (ModuleBody::Osc(_), Slot::Field(0)) => format!("Port {:.0}", shown.round()),
+        (ModuleBody::Osc(_), Slot::Field(i)) => format!("{} {}", modules::math::osc::OSC_LABELS[i.min(2)], fmt_num(shown)),
         _ => format!("{}{suffix}", fmt_num(shown)),
     };
     Some(ParamView { param, shown, driven, text })
@@ -1179,6 +1358,9 @@ fn param_title(module: &PlacedModule, slot: Slot) -> String {
             ["Map \u{00B7} From min", "Map \u{00B7} From max", "Map \u{00B7} To min", "Map \u{00B7} To max", "Map \u{00B7} Bias (added to the input)"][i.min(4)].into()
         }
         (ModuleBody::Wled(_), _) => "WLED \u{00B7} Raw max (full-scale reading)".into(),
+        (ModuleBody::Osc(_), Slot::Field(i)) => {
+            ["OSC \u{00B7} UDP port", "OSC \u{00B7} Value mapped to 0", "OSC \u{00B7} Value mapped to 1"][i.min(2)].into()
+        }
         (ModuleBody::Shader(s), Slot::Prop(i)) => {
             format!("Shader \u{00B7} {}", s.props().get(i).map_or("", |p| p.label.as_str()))
         }
@@ -1242,7 +1424,7 @@ fn start_edit(model: &mut Model, target: ParamTarget, field: EditField) {
         EditField::Min => param.min,
         EditField::Max => param.max,
     };
-    model.editing = Some(TextEdit { target: EditTarget::Param(target, field), buffer: fmt_num(value), fresh: true });
+    model.editing = Some(TextEdit::new(EditTarget::Param(target, field), fmt_num(value), false));
 }
 
 /// Applies what was typed (an unparsable number is just dropped).
@@ -1264,6 +1446,12 @@ fn commit_edit(model: &mut Model) {
                 g.title = title.to_string();
             }
         }
+        EditTarget::TabName(i) => {
+            let name = edit.buffer.trim();
+            if let (false, Some(tab)) = (name.is_empty(), model.tabs.get_mut(i)) {
+                tab.name = name.to_string();
+            }
+        }
         EditTarget::PresetName(i) => {
             let name = edit.buffer.trim();
             if let (false, Some(p)) = (name.is_empty(), model.presets.get_mut(i)) {
@@ -1275,28 +1463,78 @@ fn commit_edit(model: &mut Model) {
 }
 
 /// What's typed into `field` of `target`, if that's the field being edited.
-fn editing_text(model: &Model, target: ParamTarget, field: EditField) -> Option<&str> {
+fn editing_text(model: &Model, target: ParamTarget, field: EditField) -> Option<ui::EditView<'_>> {
     model
         .editing
         .as_ref()
         .filter(|e| e.target == EditTarget::Param(target, field))
-        .map(|e| e.buffer.as_str())
+        .map(|e| ui::EditView { text: &e.buffer, cursor: e.cursor, selection: e.selection() })
 }
 
-fn editing_preset(model: &Model, index: usize) -> Option<&str> {
-    model
-        .editing
-        .as_ref()
-        .filter(|e| e.target == EditTarget::PresetName(index))
-        .map(|e| e.buffer.as_str())
+/// Caret position for a pointer over a field drawn with `label_left`.
+fn left_aligned_caret(text: &str, field: Rect, p: Point2, font: u32, inside_only: bool) -> Option<usize> {
+    if inside_only && !field.contains(p) {
+        return None;
+    }
+    Some(ui::caret_at(text, font, p.x - (field.left() + 10.0)))
 }
 
-fn editing_title(model: &Model, group: u64) -> Option<&str> {
-    model
-        .editing
-        .as_ref()
-        .filter(|e| e.target == EditTarget::GroupTitle(group))
-        .map(|e| e.buffer.as_str())
+/// The caret position under the pointer for the text being edited (a
+/// number box or a tab name). With `inside_only`, `None` when the pointer
+/// is outside its field; a drag passes false to keep following the pointer.
+fn caret_for_pointer(model: &Model, win: Rect, screen: Point2, inside_only: bool) -> Option<usize> {
+    let edit = model.editing.as_ref()?;
+    match edit.target {
+        EditTarget::Param(target, field) => {
+            let (rect, p, font) = match param_menu_layout(model, win) {
+                Some((_, layout)) => {
+                    let rect = match field {
+                        EditField::Value => layout.value,
+                        EditField::Min => layout.min,
+                        EditField::Max => layout.max,
+                    };
+                    (rect, screen, 12)
+                }
+                None if field == EditField::Value => {
+                    let rect = param_rect_of(model, target)?;
+                    (rect, to_world(model, screen), if target.slot == Slot::Main { 13 } else { 11 })
+                }
+                None => return None,
+            };
+            if inside_only && !rect.contains(p) {
+                return None;
+            }
+            let x = p.x - (rect.x() - ui::text_width(&edit.buffer, font) / 2.0);
+            Some(ui::caret_at(&edit.buffer, font, x))
+        }
+        EditTarget::TabName(i) => project::caret_for(model, win, i, screen, inside_only),
+        EditTarget::GroupTitle(id) => {
+            let group = model.groups.iter().find(|g| g.id == id)?;
+            let frame = model.group_frame(group)?;
+            let field = group::title_rect(frame).pad_right(group::BUTTONS.len() as f32 * 24.0 + 8.0).pad_left(4.0);
+            left_aligned_caret(&edit.buffer, field, to_world(model, screen), 13, inside_only)
+        }
+        EditTarget::PresetName(i) => {
+            let field = sidebar_items(model, win).into_iter().find_map(|row| match row {
+                SidebarRow::Module { row_rect, action: SidebarAction::Preset(p), .. } if p == i => Some(row_rect),
+                _ => None,
+            })?;
+            left_aligned_caret(&edit.buffer, field.pad_left(18.0).pad_right(28.0).pad_left(4.0), screen, 13, inside_only)
+        }
+        EditTarget::WledAddress => left_aligned_caret(&edit.buffer, wled_layout(model, win).address, screen, 12, inside_only),
+    }
+}
+
+fn edit_view(edit: &TextEdit) -> ui::EditView<'_> {
+    ui::EditView { text: &edit.buffer, cursor: edit.cursor, selection: edit.selection() }
+}
+
+fn editing_preset(model: &Model, index: usize) -> Option<ui::EditView<'_>> {
+    model.editing.as_ref().filter(|e| e.target == EditTarget::PresetName(index)).map(edit_view)
+}
+
+fn editing_title(model: &Model, group: u64) -> Option<ui::EditView<'_>> {
+    model.editing.as_ref().filter(|e| e.target == EditTarget::GroupTitle(group)).map(edit_view)
 }
 
 // --- Selection, clipboard, groups ------------------------------------------------
@@ -1351,14 +1589,50 @@ fn ungroup_selection(model: &mut Model) {
 }
 
 /// Deletes modules (never Output), their cables, and empty groups.
+/// Before module `id` goes: whatever feeds its top input (the first one of
+/// the same signal type as its output) is wired to everything its output fed.
+fn bridge_over(model: &mut Model, id: u64) {
+    let Some(module) = model.modules.iter().find(|m| m.id == id) else { return };
+    let Some(signal) = output_type(module.kind) else { return };
+    let types = module.input_types();
+    let upstream = (0..types.len())
+        .filter(|&n| types[n] == signal)
+        .find_map(|n| multi_input::sources(&model.connections, id, n).first().copied());
+    let Some(upstream) = upstream else { return };
+    let downstream: Vec<(u64, usize)> =
+        model.connections.iter().filter(|c| c.from == id).map(|c| (c.to, c.to_input)).collect();
+    for (to, to_input) in downstream {
+        if to == upstream {
+            continue;
+        }
+        let Some(kind) = model.modules.iter().find(|m| m.id == to).map(|m| m.kind) else { continue };
+        // A multi port keeps the order: the bridge takes the deleted cable's place.
+        if multi_input::is_multi(kind, to_input) {
+            if let Some(pos) = model.connections.iter().position(|c| c.from == id && c.to == to && c.to_input == to_input) {
+                if model.connections.iter().any(|c| c.from == upstream && c.to == to && c.to_input == to_input) {
+                    continue;
+                }
+                model.connections[pos].from = upstream;
+            }
+        } else {
+            multi_input::connect(&mut model.connections, kind, upstream, to, to_input);
+        }
+    }
+}
+
 fn delete_modules(model: &mut Model, ids: &[u64]) {
     let output_id = model.output_id;
     let doomed: Vec<u64> = ids.iter().copied().filter(|id| *id != output_id).collect();
     if doomed.is_empty() {
         return;
     }
+    // Take them out one at a time, each leaving its upstream wired to its
+    // downstream so the path from the top input to the output survives.
+    for &id in &doomed {
+        bridge_over(model, id);
+        model.connections.retain(|c| c.from != id && c.to != id);
+    }
     model.modules.retain(|m| !doomed.contains(&m.id));
-    model.connections.retain(|c| !doomed.contains(&c.from) && !doomed.contains(&c.to));
     for g in &mut model.groups {
         g.members.retain(|id| !doomed.contains(id));
     }
@@ -1406,6 +1680,8 @@ enum ItemTarget {
     Group(u64),
     /// Save would replace `composition.json`: overwrite it or pick a name.
     SaveConflict,
+    /// A project tab (index into `tabs`).
+    Tab(usize),
 }
 
 struct ItemMenu {
@@ -1426,6 +1702,8 @@ enum ItemCommand {
     UngroupGroup(u64),
     SaveOverwrite,
     SaveAsOtherName,
+    RenameTab(usize),
+    CloseTab(usize),
     Dismiss,
 }
 
@@ -1443,6 +1721,7 @@ fn item_menu_items(model: &Model, target: ItemTarget) -> Vec<(&'static str, Item
             items.push(("Delete", DeletePreset(i)));
             items
         }
+        ItemTarget::Tab(i) => vec![("Rename", RenameTab(i)), ("Close", CloseTab(i))],
         ItemTarget::SaveConflict => vec![
             ("Overwrite existing file", SaveOverwrite),
             ("Save with another name\u{2026}", SaveAsOtherName),
@@ -1470,7 +1749,7 @@ fn run_item_command(model: &mut Model, win: Rect, command: ItemCommand) {
         }
         ItemCommand::RenamePreset(i) => {
             if let Some(name) = model.presets.get(i).map(|p| p.name.clone()) {
-                model.editing = Some(TextEdit { target: EditTarget::PresetName(i), buffer: name, fresh: true });
+                model.editing = Some(TextEdit::new(EditTarget::PresetName(i), name, true));
                 model.notify("Type the new name, Enter to confirm, Esc to cancel");
             }
         }
@@ -1508,6 +1787,8 @@ fn run_item_command(model: &mut Model, win: Rect, command: ItemCommand) {
             )
             .map(|f| DialogReply::SaveProject(f.path().to_path_buf()))
         }),
+        ItemCommand::RenameTab(i) => project::start_rename(model, i),
+        ItemCommand::CloseTab(i) => project::close_tab(model, win, i),
         ItemCommand::Dismiss => {}
         _ => {}
     }
@@ -1515,7 +1796,7 @@ fn run_item_command(model: &mut Model, win: Rect, command: ItemCommand) {
 
 fn start_group_rename(model: &mut Model, id: u64) {
     if let Some(title) = model.groups.iter().find(|g| g.id == id).map(|g| g.title.clone()) {
-        model.editing = Some(TextEdit { target: EditTarget::GroupTitle(id), buffer: title, fresh: true });
+        model.editing = Some(TextEdit::new(EditTarget::GroupTitle(id), title, true));
         model.notify("Type the new name, Enter to confirm, Esc to cancel");
     }
 }
@@ -1576,6 +1857,20 @@ fn param_menu_layout(model: &Model, win: Rect) -> Option<(ParamTarget, MenuLayou
 // --- Input -----------------------------------------------------------------------
 
 fn handle_press(app: &App, model: &mut Model, win: Rect, mouse: Point2) {
+    // A click inside the tab name being edited moves the caret instead of ending the edit.
+    if let Some(at) = caret_for_pointer(model, win, mouse, true) {
+        let double = model.last_click.is_some_and(|(t, p)| t.elapsed() < Duration::from_millis(400) && p.distance(mouse) < 6.0);
+        model.last_click = Some((Instant::now(), mouse));
+        if let Some(edit) = model.editing.as_mut() {
+            if double {
+                edit.select_all();
+            } else {
+                edit.click_at(at);
+                model.dragging = Some(Drag::TextSelect);
+            }
+        }
+        return;
+    }
     commit_edit(model);
     if start_button_rect(win).contains(mouse) && !popup_open(model) {
         enter_fullscreen(app, model);
@@ -1590,6 +1885,7 @@ fn popup_open(model: &Model) -> bool {
         || model.palette_open
         || model.canvas_menu.is_some()
         || model.item_menu.is_some()
+        || model.stack_menu.is_some()
         || open_dropdown(model).is_some()
 }
 
@@ -1609,6 +1905,12 @@ fn open_dropdown(model: &Model) -> Option<usize> {
 fn handle_right_press(model: &mut Model, win: Rect, screen: Point2) {
     commit_edit(model);
     close_popups(model);
+    if project::bar_rect(win).contains(screen) {
+        if let Some(i) = project::tab_at(model, win, screen) {
+            model.item_menu = Some(ItemMenu { at: screen, target: ItemTarget::Tab(i) });
+        }
+        return;
+    }
     // Right-clicking a saved group in the sidebar opens its options.
     if sidebar_rect(win).contains(screen) {
         let hit = sidebar_items(model, win).into_iter().find_map(|row| match row {
@@ -1846,6 +2148,27 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
         .is_some_and(|(at, pos)| at.elapsed() < Duration::from_millis(400) && pos.distance(screen_mouse) < 6.0);
     model.last_click = Some((Instant::now(), screen_mouse));
 
+    if let Some(menu) = model.stack_menu.take() {
+        let n = multi_input::sources(&model.connections, menu.module, 0).len();
+        let (panel, rows) = stack_menu_layout(win, menu.at, n);
+        if panel.contains(screen_mouse) {
+            for (k, row) in rows.iter().enumerate() {
+                if row.up.contains(screen_mouse) {
+                    move_layer(model, menu.module, k, -1);
+                } else if row.down.contains(screen_mouse) {
+                    move_layer(model, menu.module, k, 1);
+                } else if row.remove.contains(screen_mouse) {
+                    remove_layer(model, menu.module, k);
+                }
+            }
+            // Stays open for more changes while there are layers to order.
+            if !multi_input::sources(&model.connections, menu.module, 0).is_empty() {
+                model.stack_menu = Some(menu);
+            }
+        }
+        return;
+    }
+
     if let Some(menu) = model.item_menu.take() {
         let items = item_menu_items(model, menu.target);
         if let Some(i) = (0..items.len()).find(|&i| canvas_menu_row(win, menu.at, items.len(), i).contains(screen_mouse)) {
@@ -1859,6 +2182,10 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
         if let Some(i) = (0..items.len()).find(|&i| canvas_menu_row(win, at, items.len(), i).contains(screen_mouse)) {
             run_canvas_command(model, items[i], to_world(model, at));
         }
+        return;
+    }
+
+    if project::press(model, win, screen_mouse, double_click) {
         return;
     }
 
@@ -1983,11 +2310,22 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
     if settings_button_rect(win).contains(screen_mouse) {
         model.settings_open = !model.settings_open;
         model.wled_open = false;
+        model.help_open = false;
+        return;
+    }
+    if help_button_rect(win).contains(screen_mouse) {
+        model.help_open = !model.help_open;
+        model.settings_open = false;
+        model.wled_open = false;
         return;
     }
     if wled_button_rect(win).contains(screen_mouse) {
         model.wled_open = !model.wled_open;
         model.settings_open = false;
+        model.help_open = false;
+        return;
+    }
+    if model.help_open && help_panel_rect(win).contains(screen_mouse) {
         return;
     }
     if model.wled_open && wled_layout(model, win).panel.contains(screen_mouse) {
@@ -2069,6 +2407,15 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
         return;
     }
 
+    for i in 0..2 {
+        if sidebar_tab_rect(win, i).contains(screen_mouse) {
+            if model.examples_tab != (i == 1) {
+                model.examples_tab = i == 1;
+                model.sidebar_scroll = 0.0;
+            }
+            return;
+        }
+    }
     if sidebar_list_rect(win).contains(screen_mouse) {
         let hit = sidebar_items(model, win).into_iter().find_map(|row| match row {
             SidebarRow::Module { row_rect, action, .. } if row_rect.contains(screen_mouse) => Some(action),
@@ -2080,10 +2427,27 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             }
             Some(SidebarAction::ShaderCategory { category, role }) => {
                 let id = spawn_module(win, model, ModuleKind::for_shader_role(role));
+                // A category with a single shader has nothing to choose: open it.
+                let mut files = model.shader_library.iter().filter(|i| i.category == category && i.role == role);
+                let only = match (files.next(), files.next()) {
+                    (Some(info), None) => Some(info.file.clone()),
+                    _ => None,
+                };
                 if let Some(ModuleBody::Shader(shader)) = model.modules.iter_mut().find(|m| m.id == id).map(|m| &mut m.body) {
                     shader.category = Some(category);
+                    if only.is_some() {
+                        shader.select(only);
+                    }
                 }
                 model.selected = vec![id];
+            }
+            Some(SidebarAction::Example(i)) => {
+                // Examples are whole projects: each opens in a tab of its own.
+                let Some((name, json)) = model.examples.get(i).map(|e| (e.name.clone(), e.json)) else { return };
+                match project::open(model, win, name.clone(), |m| save::load_composition_json(m, win, json)) {
+                    Ok(()) => model.notify(format!("Opened example \u{201C}{name}\u{201D}")),
+                    Err(err) => model.status = Some((format!("Example {name}: {err}"), true, Instant::now())),
+                }
             }
             Some(SidebarAction::Preset(i)) => {
                 if let Some(snippet) = model.presets.get(i).map(|p| p.snippet.clone()) {
@@ -2251,12 +2615,17 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
         }
 
         let inputs = model.modules[i].input_types().len();
-        if let Some(input_index) =
-            (0..inputs).find(|&n| mouse.distance(module_input_port(kind, body, n, inputs)) <= PORT_HIT_RADIUS)
-        {
+        if let Some(input_index) = (0..inputs).find(|&n| port_hit(kind, body, n, inputs, mouse)) {
+            // A multi-input pill opens its order menu instead of picking a cable up.
+            if multi_input::is_multi(kind, input_index) {
+                if !multi_input::sources(&model.connections, id, input_index).is_empty() {
+                    model.stack_menu = Some(StackMenu { module: id, at: screen_mouse });
+                }
+                return;
+            }
             // Pick up whatever's already plugged in here, if anything,
             // so it can be moved to a different input or unplugged.
-            if let Some(pos) = model.connections.iter().position(|c| c.to == id && c.to_input == input_index) {
+            if let Some(pos) = model.connections.iter().rposition(|c| c.to == id && c.to_input == input_index) {
                 let from = model.connections.remove(pos).from;
                 model.dragging = Some(Drag::Cable { from });
             }
@@ -2344,6 +2713,7 @@ fn default_param(model: &Model, target: ParamTarget) -> Param {
         (Some(ModuleBody::Video(_)), _) => VideoState::new().speed,
         (Some(ModuleBody::Map(_)), Slot::Field(i)) => modules::math::map::MapState::new().fields[i.min(4)],
         (Some(ModuleBody::Wled(_)), _) => WledState::new().raw_max,
+        (Some(ModuleBody::Osc(_)), Slot::Field(i)) => modules::math::osc::OscState::new().fields[i.min(2)],
         (Some(ModuleBody::Blend(_)), _) => modules::mix::blend::BlendState::new().mix,
         (Some(ModuleBody::Shader(s)), Slot::Prop(i)) => s.props().get(i).map_or(Param::unit(0.0), |p| p.param()),
         _ => Param::unit(0.0),
@@ -2433,7 +2803,7 @@ fn handle_release(app: &App, model: &mut Model) {
             if *port_type != from_type {
                 continue;
             }
-            if mouse.distance(module_input_port(module.kind, body, input_index, types.len())) <= PORT_HIT_RADIUS {
+            if port_hit(module.kind, body, input_index, types.len(), mouse) {
                 target = Some((module.id, input_index));
                 break;
             }
@@ -2446,14 +2816,16 @@ fn handle_release(app: &App, model: &mut Model) {
     // Dropped on another cable of the same signal type: it takes that
     // cable's place on the input it feeds.
     if target.is_none() {
-        if let Some(c) = cable_drop_target(model, from, mouse).and_then(|i| model.connections.get(i)) {
+        if let Some(i) = cable_drop_target(model, from, mouse) {
+            let c = model.connections.remove(i);
             target = Some((c.to, c.to_input));
         }
     }
 
     if let Some((to, to_input)) = target {
-        model.connections.retain(|c| !(c.to == to && c.to_input == to_input));
-        model.connections.push(Connection { from, to, to_input });
+        if let Some(kind) = model.modules.iter().find(|m| m.id == to).map(|m| m.kind) {
+            multi_input::connect(&mut model.connections, kind, from, to, to_input);
+        }
     }
     // Dropped in empty space (or on a mismatched port type): stays
     // disconnected (already removed from `connections` in handle_press
@@ -2465,6 +2837,7 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
     match model.dragging {
         Some(Drag::Pan { .. } | Drag::Module { .. } | Drag::Group { .. }) => return CursorIcon::Grabbing,
         Some(Drag::Marquee { .. }) => return CursorIcon::Crosshair,
+        Some(Drag::TextSelect) => return CursorIcon::Text,
         Some(Drag::Param { .. } | Drag::Setting { .. } | Drag::Scrub { .. }) => return CursorIcon::EwResize,
         Some(Drag::Cable { .. }) => return CursorIcon::Crosshair,
         None => {}
@@ -2478,7 +2851,7 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
     if popup_open(model) {
         return CursorIcon::Hand;
     }
-    let buttons = [start_button_rect(win), save_button_rect(win), load_button_rect(win), settings_button_rect(win), wled_button_rect(win)];
+    let buttons = [start_button_rect(win), save_button_rect(win), load_button_rect(win), settings_button_rect(win), help_button_rect(win), wled_button_rect(win)];
     let sidebar_hit = sidebar_list_rect(win).contains(screen)
         && sidebar_items(model, win)
             .iter()
@@ -2513,7 +2886,7 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
             };
         let inputs = module.input_types().len();
         let on_port = (has_output(module.kind) && world.distance(module_output_port(body)) <= PORT_HIT_RADIUS)
-            || (0..inputs).any(|n| world.distance(module_input_port(module.kind, body, n, inputs)) <= PORT_HIT_RADIUS);
+            || (0..inputs).any(|n| port_hit(module.kind, body, n, inputs, world));
         if on_title_button || on_selector || on_port {
             return CursorIcon::Hand;
         }
@@ -2593,7 +2966,16 @@ fn load_button_rect(win: Rect) -> Rect {
 
 fn settings_button_rect(win: Rect) -> Rect {
     let sidebar = sidebar_rect(win);
-    Rect::from_x_y_w_h(sidebar.x(), sidebar.bottom() + 28.0, sidebar.w() - 16.0, 32.0)
+    let w = (sidebar.w() - 16.0 - 8.0) * 0.6;
+    Rect::from_x_y_w_h(sidebar.left() + 8.0 + w / 2.0, sidebar.bottom() + 28.0, w, 32.0)
+}
+
+/// Help sits beside Settings.
+fn help_button_rect(win: Rect) -> Rect {
+    let sidebar = sidebar_rect(win);
+    let settings = settings_button_rect(win);
+    let w = sidebar.w() - 16.0 - 8.0 - settings.w();
+    Rect::from_x_y_w_h(sidebar.right() - 8.0 - w / 2.0, settings.y(), w, 32.0)
 }
 
 const SETTINGS_ROW_TOP: f32 = 150.0;
@@ -2652,28 +3034,56 @@ fn center_on_modules(model: &mut Model, win: Rect) {
 }
 
 fn sidebar_items(model: &Model, win: Rect) -> Vec<SidebarRow> {
-    sidebar_rows(win, &model.shader_library, &model.presets, model.sidebar_scroll)
+    sidebar_rows(win, &model.shader_library, &model.presets, model.examples_tab.then_some(&model.examples[..]), model.sidebar_scroll)
 }
 
 /// The scrollable middle of the sidebar, between Save/Load and Settings.
 fn wled_button_rect(win: Rect) -> Rect {
-    settings_button_rect(win).shift_y(40.0)
+    let sidebar = sidebar_rect(win);
+    Rect::from_x_y_w_h(sidebar.x(), settings_button_rect(win).y() + 40.0, sidebar.w() - 16.0, 32.0)
 }
 
 fn sidebar_list_rect(win: Rect) -> Rect {
     let sidebar = sidebar_rect(win);
     Rect::from_corners(
         pt2(sidebar.left(), wled_button_rect(win).top() + 8.0),
-        pt2(sidebar.right(), sidebar.top() - SIDEBAR_HEADER_H),
+        pt2(sidebar.right(), sidebar.top() - SIDEBAR_HEADER_H - SIDEBAR_TABS_H),
     )
 }
 
-fn sidebar_rows(win: Rect, library: &[ShaderInfo], presets: &[Preset], scroll: f32) -> Vec<SidebarRow> {
+/// Tab 0 is the module list, tab 1 the bundled examples.
+fn sidebar_tab_rect(win: Rect, i: usize) -> Rect {
+    let sidebar = sidebar_rect(win);
+    let w = (sidebar.w() - 16.0 - 4.0) / 2.0;
+    let x = sidebar.x() + if i == 0 { -(w / 2.0 + 2.0) } else { w / 2.0 + 2.0 };
+    Rect::from_x_y_w_h(x, sidebar.top() - SIDEBAR_HEADER_H - SIDEBAR_TABS_H / 2.0 - 2.0, w, 26.0)
+}
+
+fn sidebar_rows(win: Rect, library: &[ShaderInfo], presets: &[Preset], examples: Option<&[examples::Example]>, scroll: f32) -> Vec<SidebarRow> {
     let sidebar = sidebar_rect(win);
     let mut rows = Vec::new();
-    let mut y = sidebar.top() - SIDEBAR_HEADER_H - 24.0 + scroll;
+    let mut y = sidebar.top() - SIDEBAR_HEADER_H - SIDEBAR_TABS_H - 24.0 + scroll;
     let row = |y: f32, h: f32| Rect::from_x_y_w_h(sidebar.x(), y, sidebar.w() - 16.0, h);
     let plus = |r: Rect| Rect::from_w_h(24.0, 24.0).mid_right_of(r).shift_x(-4.0);
+
+    if let Some(examples) = examples {
+        for (heading, kind, hint) in [
+            ("By module", examples::ExampleKind::Box, "Each one opens as its own project"),
+            ("Full projects", examples::ExampleKind::Composition, "Each one opens as its own project"),
+        ] {
+            rows.push(SidebarRow::Header { rect: row(y, 26.0), label: heading.to_string(), sub: false });
+            y -= 28.0;
+            rows.push(SidebarRow::Hint { rect: row(y - 4.0, 18.0), text: hint });
+            y -= 28.0;
+            for (i, example) in examples.iter().enumerate().filter(|(_, e)| e.kind == kind) {
+                let row_rect = row(y, 28.0);
+                rows.push(SidebarRow::Module { row_rect, plus_rect: plus(row_rect), label: example.name.clone(), action: SidebarAction::Example(i) });
+                y -= 32.0;
+            }
+            y -= 12.0;
+        }
+        return rows;
+    }
 
     for (category, mods) in CATEGORIES {
         rows.push(SidebarRow::Header { rect: row(y, 26.0), label: category.to_string(), sub: false });
@@ -2688,9 +3098,13 @@ fn sidebar_rows(win: Rect, library: &[ShaderInfo], presets: &[Preset], scroll: f
         // Every shader is an effect of its own, listed under its category.
         // One node per shader category (and role); the shader is picked
         // from the node's own list.
-        if *category == "Effects" {
+        if *category == "Effects" || *category == "Mix" {
             let mut seen: Vec<(&str, ShaderRole)> = Vec::new();
             for info in library {
+                // Mixing shaders live under Mix, everything else under Effects.
+                if (info.role == ShaderRole::Mix) != (*category == "Mix") {
+                    continue;
+                }
                 if seen.contains(&(info.category.as_str(), info.role)) {
                     continue;
                 }
@@ -2725,7 +3139,7 @@ fn sidebar_rows(win: Rect, library: &[ShaderInfo], presets: &[Preset], scroll: f
 
 /// Scrolls the sidebar list by `dy` pixels, within its content.
 fn scroll_sidebar(model: &mut Model, win: Rect, dy: f32) {
-    let rows = sidebar_rows(win, &model.shader_library, &model.presets, 0.0);
+    let rows = sidebar_rows(win, &model.shader_library, &model.presets, model.examples_tab.then_some(&model.examples[..]), 0.0);
     let bottom = rows
         .iter()
         .map(|r| match r {
@@ -2769,7 +3183,7 @@ fn config_rect(body: Rect) -> Rect {
 
 /// Modules with a second row holding a mode selector.
 fn has_mode_row(kind: ModuleKind) -> bool {
-    matches!(kind, ModuleKind::Lfo | ModuleKind::Blend | ModuleKind::Lag)
+    matches!(kind, ModuleKind::Lfo | ModuleKind::Blend | ModuleKind::Stack | ModuleKind::Lag)
 }
 
 /// The second row's mode selector (LFO wave, blend mode, lag curve); the
@@ -2819,7 +3233,8 @@ fn field_rect(module: &PlacedModule, body: Rect, i: usize) -> Rect {
 }
 
 /// Map's buttons: Cal beside the bias box, then Clamp / Auto / Center in a row.
-const MAP_BUTTONS: [&str; 4] = ["Cal", "Clamp", "Auto", "Center"];
+// "Center" (button 3, `MapState::center`) still works in the code but is hidden until it is tested.
+const MAP_BUTTONS: [&str; 3] = ["Cal", "Clamp", "Auto"];
 
 fn map_button_rect(body: Rect, i: usize) -> Rect {
     if i == 0 {
@@ -2828,7 +3243,7 @@ fn map_button_rect(body: Rect, i: usize) -> Rect {
         return Rect::from_x_y_w_h(row.right() - half / 2.0, row.y(), half, row.h());
     }
     let row = config_rect(body).shift_y(-108.0);
-    let w = (row.w() - 12.0) / 3.0;
+    let w = (row.w() - 6.0) / 2.0;
     Rect::from_x_y_w_h(row.left() + w / 2.0 + (i - 1) as f32 * (w + 6.0), row.y(), w, row.h())
 }
 
@@ -2840,6 +3255,11 @@ fn math_readout_rect(module: &PlacedModule, body: Rect) -> Rect {
     match module.kind {
         ModuleKind::Map => {
             config_rect(body).shift_y(-144.0)
+        }
+        ModuleKind::Osc => {
+            let row = config_rect(body).shift_y(-36.0);
+            let half = (row.w() - 6.0) / 2.0;
+            Rect::from_x_y_w_h(row.right() - half / 2.0, row.y(), half, row.h())
         }
         _ => config_rect(body).shift_y(-36.0),
     }
@@ -2915,6 +3335,7 @@ fn wled_layout(model: &Model, win: Rect) -> WledLayout {
 /// Over the open Settings or WLED panel.
 fn over_panel(model: &Model, win: Rect, screen: Point2) -> bool {
     (model.settings_open && settings_panel_rect(win, model.debug_open).contains(screen))
+        || (model.help_open && help_panel_rect(win).contains(screen))
         || (model.wled_open && wled_layout(model, win).panel.contains(screen))
 }
 
@@ -2959,12 +3380,12 @@ fn draw_wled_panel(draw: &Draw, t: &Theme, win: Rect, model: &Model, mouse: Poin
     }
 
     let caret = (model.fps.since.elapsed().as_millis() / 500) % 2 == 0;
-    let typed = model.editing.as_ref().filter(|e| e.target == EditTarget::WledAddress).map(|e| e.buffer.as_str());
+    let typed = model.editing.as_ref().filter(|e| e.target == EditTarget::WledAddress).map(edit_view);
     let field = layout.address;
     ui::rounded(draw, field, ui::RADIUS, t.field);
     ui::rounded_outline(draw, field, ui::RADIUS, if typed.is_some() { t.accent } else { t.border }, if typed.is_some() { 2.0 } else { 1.0 });
     match typed {
-        Some(text) => ui::label_left(draw, field, &format!("{text}{}", if caret { "|" } else { "" }), t.field_text, 12),
+        Some(view) => ui::edit_label_left(draw, t, field, view, t.field_text, 12, caret),
         None => ui::label_left(draw, field, "IP address or host name", t.fill_driven, 12),
     }
     ui::button(draw, t, layout.add, "Add", layout.add.contains(mouse));
@@ -2989,7 +3410,7 @@ fn wled_panel_press(model: &mut Model, win: Rect, screen: Point2) {
         return;
     }
     if layout.address.contains(screen) {
-        model.editing = Some(TextEdit { target: EditTarget::WledAddress, buffer: String::new(), fresh: false });
+        model.editing = Some(TextEdit::new(EditTarget::WledAddress, String::new(), false));
         return;
     }
     if layout.add.contains(screen) {
@@ -3095,7 +3516,9 @@ fn poll_dialogs(app: &App, model: &mut Model) {
                 model.status = Some((message, is_error, Instant::now()));
             }
             Some(DialogReply::Composition(path)) => {
-                let (message, is_error) = match load_composition(model, app.window_rect(), &path) {
+                let win = app.window_rect();
+                let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("project").to_string();
+                let (message, is_error) = match project::open(model, win, name, |m| load_composition(m, win, &path)) {
                     Ok(()) => {
                         if model.settings.project_mode {
                             set_project(app, model, path.clone());
@@ -3164,6 +3587,13 @@ fn is_minimized_body(body: Rect) -> bool {
 /// Input ports are spaced evenly down the left edge; a single input sits
 /// dead center, matching every module that used to have exactly one.
 fn module_input_port(kind: ModuleKind, body: Rect, index: usize, total: usize) -> Point2 {
+    // A Stack's layers plug into one pill; its mix input hangs below it.
+    if kind == ModuleKind::Stack {
+        if is_minimized_body(body) {
+            return pt2(body.left(), body.top() - MINIMIZED_H / 2.0);
+        }
+        return if index == 0 { pill_rect(body).xy() } else { pt2(body.left(), body.top() - 104.0) };
+    }
     // Shader ports hang below the file selector, one labelled row each.
     if kind.is_shader() {
         if is_minimized_body(body) {
@@ -3179,6 +3609,131 @@ fn module_input_port(kind: ModuleKind, body: Rect, index: usize, total: usize) -
     }
     let step = body.h() / (total as f32 + 1.0);
     pt2(body.left(), body.top() - step * (index as f32 + 1.0))
+}
+
+// --- Multi-input pill ----------------------------------------------------------
+
+const PILL_W: f32 = 22.0;
+const PILL_H: f32 = 56.0;
+
+/// The pill a multi-input port is drawn as, centered on the left edge.
+fn pill_rect(body: Rect) -> Rect {
+    if is_minimized_body(body) {
+        return Rect::from_x_y_w_h(body.left(), body.top() - MINIMIZED_H / 2.0, PILL_W, 18.0);
+    }
+    Rect::from_x_y_w_h(body.left(), body.top() - 50.0, PILL_W, PILL_H)
+}
+
+/// Where the `k`-th of `n` cables ends inside the pill, first on top.
+fn pill_slot(body: Rect, k: usize, n: usize) -> Point2 {
+    let rect = pill_rect(body);
+    if n <= 1 {
+        return rect.xy();
+    }
+    let spacing = ((rect.h() - 16.0) / (n as f32 - 1.0)).min(12.0);
+    pt2(rect.x(), rect.y() + spacing * (n as f32 - 1.0) / 2.0 - k as f32 * spacing)
+}
+
+/// Whether `p` is on input `index` (a multi-input's pill is a bigger target).
+fn port_hit(kind: ModuleKind, body: Rect, index: usize, total: usize, p: Point2) -> bool {
+    if multi_input::is_multi(kind, index) {
+        return pill_rect(body).pad(-4.0).contains(p);
+    }
+    p.distance(module_input_port(kind, body, index, total)) <= PORT_HIT_RADIUS
+}
+
+fn draw_pill(draw: &Draw, t: &Theme, body: Rect, layers: usize, hovered: bool) {
+    let rect = pill_rect(body);
+    let color = t.port(PortType::Video);
+    ui::rounded(draw, rect, rect.w() / 2.0, t.port_ring);
+    ui::rounded_outline(draw, rect, rect.w() / 2.0, color, if hovered { 4.0 } else { 2.5 });
+    if layers == 0 {
+        draw.ellipse().xy(rect.xy()).radius(3.0).no_fill().stroke(color).stroke_weight(1.5);
+    }
+    for k in 0..layers {
+        draw.ellipse().xy(pill_slot(body, k, layers)).radius(3.5).color(color);
+    }
+    let label = if layers == 0 { "layers".to_string() } else { format!("\u{00D7}{layers}") };
+    let text = Rect::from_corners(pt2(rect.right() + 6.0, rect.y() - 9.0), pt2(rect.right() + 70.0, rect.y() + 9.0));
+    ui::label_left(draw, text, &label, t.title_text, 11);
+}
+
+// --- Stack order menu ----------------------------------------------------------
+
+struct StackMenu {
+    module: u64,
+    at: Point2,
+}
+
+struct StackRow {
+    up: Rect,
+    down: Rect,
+    remove: Rect,
+    label: Rect,
+}
+
+const STACK_ROW_H: f32 = 28.0;
+
+/// The menu's panel and one row per layer, for a menu opened at `at`.
+fn stack_menu_layout(win: Rect, at: Point2, n: usize) -> (Rect, Vec<StackRow>) {
+    let (w, h) = (300.0, 40.0 + n as f32 * STACK_ROW_H);
+    let left = at.x.min(win.right() - w - 8.0).max(win.left() + 8.0);
+    let top = at.y.max(win.bottom() + h + 8.0).min(win.top() - 8.0);
+    let panel = Rect::from_x_y_w_h(left + w / 2.0, top - h / 2.0, w, h);
+    let rows = (0..n)
+        .map(|i| {
+            let y = top - 40.0 - STACK_ROW_H / 2.0 - i as f32 * STACK_ROW_H + 4.0;
+            let button = |from_right: f32| Rect::from_x_y_w_h(panel.right() - 18.0 - from_right, y, 24.0, 22.0);
+            StackRow {
+                remove: button(0.0),
+                down: button(28.0),
+                up: button(56.0),
+                label: Rect::from_corners(pt2(panel.left() + 12.0, y - 11.0), pt2(panel.right() - 100.0, y + 11.0)),
+            }
+        })
+        .collect();
+    (panel, rows)
+}
+
+/// What a layer is called in the menu.
+fn layer_name(model: &Model, id: u64) -> String {
+    match model.modules.iter().find(|m| m.id == id) {
+        Some(PlacedModule { body: ModuleBody::Shader(s), kind, .. }) => {
+            s.file.as_deref().map(shader_display_name).unwrap_or_else(|| kind_label(*kind).to_string())
+        }
+        Some(m) => kind_label(m.kind).to_string(),
+        None => "?".to_string(),
+    }
+}
+
+/// Moves layer `k` of a Stack `delta` places (cable order is layer order).
+fn move_layer(model: &mut Model, stack: u64, k: usize, delta: isize) {
+    let indices: Vec<usize> =
+        model.connections.iter().enumerate().filter(|(_, c)| c.to == stack && c.to_input == 0).map(|(i, _)| i).collect();
+    let Some(other) = k.checked_add_signed(delta).filter(|o| *o < indices.len()) else { return };
+    if k < indices.len() {
+        model.connections.swap(indices[k], indices[other]);
+    }
+}
+
+fn remove_layer(model: &mut Model, stack: u64, k: usize) {
+    let found = model.connections.iter().enumerate().filter(|(_, c)| c.to == stack && c.to_input == 0).nth(k).map(|(i, _)| i);
+    if let Some(i) = found {
+        model.connections.remove(i);
+    }
+}
+
+fn draw_stack_menu(draw: &Draw, t: &Theme, win: Rect, model: &Model, mouse: Point2) {
+    let Some(menu) = &model.stack_menu else { return };
+    let layers = multi_input::sources(&model.connections, menu.module, 0);
+    let (panel, rows) = stack_menu_layout(win, menu.at, layers.len());
+    ui::panel(draw, t, panel, "Stack order \u{00B7} first is the bottom");
+    for (k, (row, src)) in rows.iter().zip(&layers).enumerate() {
+        ui::label_left(draw, row.label, &format!("{}   {}", k + 1, layer_name(model, *src)), t.text, 12);
+        ui::pill_sized(draw, t, row.up, "\u{2191}", false, k > 0 && row.up.contains(mouse), 12);
+        ui::pill_sized(draw, t, row.down, "\u{2193}", false, k + 1 < layers.len() && row.down.contains(mouse), 12);
+        ui::pill_sized(draw, t, row.remove, "\u{00D7}", false, row.remove.contains(mouse), 12);
+    }
 }
 
 fn start_button_rect(win: Rect) -> Rect {
@@ -3223,9 +3778,13 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
             }
 
             ui::accent_button(&draw, t, start_button_rect(win), "Fullscreen  (F)", hover.is_some_and(|m| start_button_rect(win).contains(m)));
+            project::draw(&draw, t, win, model, hover, app.time);
             draw_sidebar(&draw, t, win, model, hover, app.time);
             if model.settings_open {
                 draw_settings_panel(&draw, t, win, model, hover);
+            }
+            if model.help_open {
+                draw_help_panel(&draw, t, win);
             }
             if model.wled_open {
                 draw_wled_panel(&draw, t, win, model, hover.unwrap_or(pt2(f32::MAX, f32::MAX)));
@@ -3273,6 +3832,7 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
                 let hovered = rows.iter().position(|r| r.contains(mouse));
                 ui::dropdown(&draw, t, &rows, &labels, None, hovered, &[]);
             }
+            draw_stack_menu(&draw, t, win, model, mouse);
             if let Some(at) = model.canvas_menu {
                 let items = canvas_menu_items(model);
                 let rows: Vec<Rect> = (0..items.len()).map(|i| canvas_menu_row(win, at, items.len(), i)).collect();
@@ -3299,7 +3859,7 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
     }
 
     if model.settings.show_fps {
-        let area = if model.view == View::Config { canvas_rect(win) } else { win };
+        let area = if model.view == View::Config { canvas_rect(win).pad_top(project::BAR_H) } else { win };
         draw_fps(&draw, t, area, &model.fps.label);
     }
 
@@ -3365,17 +3925,17 @@ fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<
                 }
                 match action {
                     SidebarAction::Spawn(_) => ui::label_left(draw, row_rect, &label, t.text, 14),
-                    SidebarAction::ShaderCategory { .. } => ui::label_left(draw, row_rect.pad_left(10.0).pad_right(28.0), &label, t.text, 13),
+                    SidebarAction::ShaderCategory { .. } | SidebarAction::Example(_) => ui::label_left(draw, row_rect.pad_left(10.0).pad_right(28.0), &label, t.text, 13),
                     SidebarAction::Preset(i) => {
                         let icon = Rect::from_x_y_w_h(row_rect.left() + 18.0, row_rect.y(), 14.0, 11.0);
                         ui::rounded_outline(draw, icon, 3.0, t.accent, 1.5);
                         let text_rect = row_rect.pad_left(18.0).pad_right(28.0);
                         match editing_preset(model, i) {
-                            Some(typed) => {
+                            Some(view) => {
                                 let caret = (now * 2.0) as i32 % 2 == 0;
                                 ui::rounded(draw, text_rect.pad(2.0), ui::RADIUS, t.field);
                                 ui::rounded_outline(draw, text_rect.pad(2.0), ui::RADIUS, t.accent, 1.5);
-                                ui::label_left(draw, text_rect.pad_left(4.0), &format!("{typed}{}", if caret { "|" } else { "" }), t.field_text, 13);
+                                ui::edit_label_left(draw, t, text_rect.pad_left(4.0), view, t.field_text, 13, caret);
                             }
                             None => ui::label_left(draw, text_rect, &label, t.text, 13),
                         }
@@ -3389,6 +3949,10 @@ fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<
 
     let header = Rect::from_corners(pt2(sidebar.left(), list.top()), sidebar.top_right());
     draw.rect().xy(header.xy()).wh(header.wh()).color(t.sidebar);
+    for (i, name) in ["Modules", "Examples"].into_iter().enumerate() {
+        let rect = sidebar_tab_rect(win, i);
+        ui::pill_sized(draw, t, rect, name, model.examples_tab == (i == 1), hovered(rect), 12);
+    }
     let footer = Rect::from_corners(sidebar.bottom_left(), pt2(sidebar.right(), list.bottom()));
     draw.rect().xy(footer.xy()).wh(footer.wh()).color(t.sidebar);
     draw.line()
@@ -3403,6 +3967,8 @@ fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<
     ui::button(draw, t, load_rect, "Load", hovered(load_rect));
     let settings_rect = settings_button_rect(win);
     ui::button(draw, t, settings_rect, "Settings", hovered(settings_rect) || model.settings_open);
+    let help_rect = help_button_rect(win);
+    ui::button(draw, t, help_rect, "Help", hovered(help_rect) || model.help_open);
     let chevron_at = pt2(settings_rect.right() - 16.0, settings_rect.y());
     ui::chevron(draw, chevron_at, 8.0, t.button_text, model.settings_open);
 
@@ -3497,6 +4063,14 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
                 }
                 ModuleBody::Video(video) => draw_video_controls(draw, t, model, module.id, video, body, &hovered),
                 ModuleBody::Wled(w) => draw_wled_controls(draw, t, model, w, body, &hovered),
+                ModuleBody::Osc(osc) => {
+                    let (text, color) = match (&osc.error, &osc.address, osc.raw()) {
+                        (Some(e), _, _) => (e.clone(), t.error),
+                        (None, Some(a), Some(v)) => (format!("{a} {}", fmt_num(v)), t.title_text),
+                        _ => ("waiting\u{2026}".to_string(), t.text_dim),
+                    };
+                    ui::label_left(draw, math_readout_rect(module, body), &text, color, 10);
+                }
                 ModuleBody::Map(map) => {
                     for (i, label) in MAP_BUTTONS.iter().enumerate() {
                         let rect = map_button_rect(body, i);
@@ -3515,7 +4089,8 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
                         (Some(i), Some(o)) => format!("{} \u{2192} {}", fmt_num(i), fmt_num(o)),
                         _ => "no input".to_string(),
                     };
-                    ui::label_left(draw, math_readout_rect(module, body), &text, t.title_text, 12);
+                    let v = ValueBox { norm: output.unwrap_or(0.0).clamp(0.0, 1.0), text: &text, driven: true, hovered: false, editing: None, caret: false };
+                    ui::value_box(draw, t, math_readout_rect(module, body), v, 12);
                 }
                 ModuleBody::Shader(shader) => {
                     let label = match (&shader.file, &shader.category) {
@@ -3594,6 +4169,11 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
     for (i, port_type) in types.iter().enumerate() {
         let pos = module_input_port(module.kind, body, i, types.len());
         let connected = model.connections.iter().any(|c| c.to == module.id && c.to_input == i);
+        if multi_input::is_multi(module.kind, i) {
+            let layers = multi_input::sources(&model.connections, module.id, i).len();
+            draw_pill(draw, t, body, if chrome.minimized { 0 } else { layers }, hover.is_some_and(|m| pill_rect(body).contains(m)));
+            continue;
+        }
         draw_port(draw, t, pos, *port_type, connected, hover.is_some_and(|m| m.distance(pos) <= PORT_HIT_RADIUS));
     }
 
@@ -3601,7 +4181,7 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
         for n in 0..shader.channels() {
             let port = module_input_port(module.kind, body, n, types.len());
             let rect = Rect::from_corners(pt2(body.left() + 20.0, port.y - 9.0), pt2(body.right() - 12.0, port.y + 9.0));
-            ui::label_left(draw, rect.pad_left(-10.0), &format!("iChannel{n}"), t.title_text, 11);
+            ui::label_left(draw, rect.pad_left(-10.0), &if shader.channels() == 1 { "Imagen In".to_string() } else { format!("Imagen In {}", n + 1) }, t.title_text, 11);
         }
         if let Some(error) = &shader.error {
             // Sits under the ports; the full text is also readable by
@@ -3725,6 +4305,101 @@ fn draw_port(draw: &Draw, t: &Theme, pos: Point2, port_type: PortType, connected
         draw.ellipse().xy(pos).radius(r).color(color).stroke(t.port_ring).stroke_weight(2.0);
     } else {
         draw.ellipse().xy(pos).radius(r).color(t.port_ring).stroke(color).stroke_weight(3.0);
+    }
+}
+
+// --- Help ----------------------------------------------------------------------
+
+enum HelpRow {
+    Section(&'static str),
+    /// A shortcut or gesture, and what it does.
+    Item(&'static str, &'static str),
+}
+
+use HelpRow::{Item, Section};
+
+const HELP_LEFT: &[HelpRow] = &[
+    Section("Canvas"),
+    Item("Drag a module", "Move it (selection follows)"),
+    Item("Shift+click", "Add / remove from selection"),
+    Item("Drag on empty", "Marquee select"),
+    Item("Middle / Shift+drag", "Pan"),
+    Item("Wheel / Cmd+scroll", "Zoom at the cursor"),
+    Item("Trackpad scroll", "Pan"),
+    Item("+  -  0", "Zoom in / out / 100%"),
+    Item("H", "Center the view"),
+    Item("L", "Auto layout"),
+    Item("Right-click", "Canvas menu"),
+    Section("Modules"),
+    Item("Cmd+C / X / V", "Copy / cut / paste"),
+    Item("D or Cmd+D", "Duplicate"),
+    Item("Del", "Delete (cables rejoin)"),
+    Item("Cmd+G", "Group (+Shift: ungroup)"),
+    Item("Cmd+A", "Select all"),
+    Item("P  /  M", "Previews / minimize all"),
+    Item("F", "Fullscreen"),
+    Item("Esc", "Deselect, close popups"),
+    Section("Cables"),
+    Item("Drag from output", "Connect to an input"),
+    Item("Drop on a cable", "Replace that cable"),
+    Item("Move node on cable", "Insert it in the path"),
+    Item("Click the Stack pill", "Order its layers"),
+];
+
+const HELP_RIGHT: &[HelpRow] = &[
+    Section("Number boxes"),
+    Item("Drag", "Change the value"),
+    Item("Shift+drag", "Fine adjustment"),
+    Item("Click", "Type a value"),
+    Item("Right-click", "Range, clamp, reset"),
+    Item("Cable in", "Drives the box (0..1)"),
+    Section("Text fields"),
+    Item("Click / drag", "Place caret / select"),
+    Item("Double-click", "Select all"),
+    Item("Shift+arrows", "Extend the selection"),
+    Item("Home / End", "Jump to start / end"),
+    Item("Cmd+A C X V", "Select all, copy, cut, paste"),
+    Item("Enter / Esc", "Confirm / cancel"),
+    Section("Projects"),
+    Item("Tabs", "Each project is independent"),
+    Item("+  /  x", "New / close project"),
+    Item("Double-click a tab", "Rename (or right-click)"),
+    Item("Examples tab", "Open one as a new project"),
+    Item("Load", "Opens in a new tab"),
+    Item("Save", "Saves the active project"),
+    Section("Help"),
+    Item("F1", "Show / hide this panel"),
+];
+
+fn help_panel_rect(win: Rect) -> Rect {
+    Rect::from_w_h(640.0, 560.0).top_right_of(canvas_rect(win)).shift(vec2(-16.0, -16.0 - project::BAR_H))
+}
+
+fn draw_help_panel(draw: &Draw, t: &Theme, win: Rect) {
+    let panel = help_panel_rect(win);
+    ui::panel(draw, t, panel, "Help \u{00B7} shortcuts and gestures");
+    let col_w = (panel.w() - 36.0) / 2.0;
+    for (c, rows) in [HELP_LEFT, HELP_RIGHT].into_iter().enumerate() {
+        let left = panel.left() + 12.0 + c as f32 * (col_w + 12.0);
+        let mut y = panel.top() - 48.0;
+        for row in rows {
+            match row {
+                Section(title) => {
+                    y -= 8.0;
+                    let r = Rect::from_corners(pt2(left, y - 18.0), pt2(left + col_w, y));
+                    ui::label_left(draw, r.pad_left(-10.0), &title.to_uppercase(), t.accent, 11);
+                    y -= 20.0;
+                }
+                Item(keys, what) => {
+                    let r = Rect::from_corners(pt2(left, y - 16.0), pt2(left + col_w, y));
+                    let keys_r = Rect::from_corners(r.bottom_left(), pt2(left + 128.0, r.top()));
+                    let what_r = Rect::from_corners(pt2(left + 128.0, r.bottom()), r.top_right());
+                    ui::label_left(draw, keys_r.pad_left(-10.0), keys, t.text, 11);
+                    ui::label_left(draw, what_r.pad_left(-10.0), what, t.text_dim, 11);
+                    y -= 17.0;
+                }
+            }
+        }
     }
 }
 
@@ -3929,7 +4604,15 @@ fn cable_ends(model: &Model, c: &Connection) -> Option<(Point2, Point2)> {
     }
     let start = from_group.map_or_else(|| module_output_port(module_body_rect(from)), |(_, f)| group::collapsed_port(f, true));
     let end = to_group.map_or_else(
-        || module_input_port(to.kind, module_body_rect(to), c.to_input, to_inputs),
+        || {
+            let body = module_body_rect(to);
+            if multi_input::is_multi(to.kind, c.to_input) && !is_minimized_body(body) {
+                let layers = multi_input::sources(&model.connections, to.id, c.to_input);
+                let k = layers.iter().position(|s| *s == c.from).unwrap_or(0);
+                return pill_slot(body, k, layers.len());
+            }
+            module_input_port(to.kind, body, c.to_input, to_inputs)
+        },
         |(_, f)| group::collapsed_port(f, false),
     );
     Some((start, end))
@@ -3967,7 +4650,7 @@ fn over_any_input_port(model: &Model, from: u64, world: Point2) -> bool {
     model.modules.iter().filter(|m| !model.hidden(m.id)).any(|m| {
         let types = m.input_types();
         let body = module_body_rect(m);
-        types.iter().enumerate().any(|(i, ty)| *ty == from_type && world.distance(module_input_port(m.kind, body, i, types.len())) <= PORT_HIT_RADIUS)
+        types.iter().enumerate().any(|(i, ty)| *ty == from_type && port_hit(m.kind, body, i, types.len(), world))
     })
 }
 
@@ -4156,10 +4839,10 @@ fn draw_groups(draw: &Draw, t: &Theme, model: &Model, now: f32, hover: Option<Po
 
         let label_rect = title_bar.pad_right(group::BUTTONS.len() as f32 * 24.0 + 8.0);
         match editing_title(model, g.id) {
-            Some(typed) => {
+            Some(view) => {
                 ui::rounded(draw, label_rect.pad(3.0), ui::RADIUS, t.field);
                 ui::rounded_outline(draw, label_rect.pad(3.0), ui::RADIUS, t.accent, 1.5);
-                ui::label_left(draw, label_rect, &format!("  {typed}{}", if caret { "|" } else { "" }), t.field_text, 13);
+                ui::edit_label_left(draw, t, label_rect.pad_left(4.0), view, t.field_text, 13, caret);
             }
             None => {
                 // Hovering the title hints that it's editable (double-click or right-click → Rename).

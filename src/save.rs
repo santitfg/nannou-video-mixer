@@ -12,6 +12,7 @@ use crate::modules::output::OutputState;
 use crate::modules::sources::camera::CameraState;
 use crate::modules::sources::video::{LoopMode, VideoState};
 use crate::modules::sources::wled::WledState;
+use crate::modules::math::osc::OscState;
 use crate::modules::{Connection, ModuleBody, ModuleKind, PlacedModule};
 use crate::group::Group;
 use crate::{canvas_rect, Model, ModuleChrome, SAVE_PATH};
@@ -152,6 +153,9 @@ struct SavedGroup {
 
 #[derive(Serialize, Deserialize)]
 struct SaveFile {
+    /// The project's tab name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     output_id: u64,
     modules: Vec<SavedModule>,
     connections: Vec<SavedConnection>,
@@ -343,6 +347,9 @@ fn save_module(m: &PlacedModule) -> SavedModule {
             playing = Some(video.playing);
             position = Some(video.position);
         }
+        ModuleBody::Osc(osc) => {
+            fields = Some(osc.fields.iter().map(|p| (*p).into()).collect());
+        }
         ModuleBody::Lag(lag) => {
             param = Some(lag.time.into());
             lag_mode = Some(lag.mode);
@@ -382,6 +389,7 @@ fn save_module(m: &PlacedModule) -> SavedModule {
 
 fn build_save_file(model: &Model) -> SaveFile {
     SaveFile {
+        name: model.tabs.get(model.active_tab).map(|t| t.name.clone()),
         output_id: model.output_id,
         modules: model.modules.iter().map(save_module).collect(),
         connections: model.connections.iter().map(save_connection).collect(),
@@ -405,7 +413,12 @@ pub fn save_composition_to(model: &Model, path: &std::path::Path) -> std::io::Re
 /// machine just loads unselected rather than failing the whole load.
 pub fn load_composition(model: &mut Model, win: Rect, path: &std::path::Path) -> Result<(), String> {
     let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let file: SaveFile = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    load_composition_json(model, win, &json)
+}
+
+/// Replaces the canvas with the composition in `json`.
+pub fn load_composition_json(model: &mut Model, win: Rect, json: &str) -> Result<(), String> {
+    let file: SaveFile = serde_json::from_str(json).map_err(|e| e.to_string())?;
 
     let mut modules = Vec::with_capacity(file.modules.len());
     for saved in file.modules {
@@ -414,6 +427,9 @@ pub fn load_composition(model: &mut Model, win: Rect, path: &std::path::Path) ->
         modules.push(PlacedModule { id, kind, pos, body });
     }
     finish_load(model, win, modules, file.output_id, file.connections, file.groups);
+    if let (Some(name), Some(tab)) = (file.name.filter(|n| !n.is_empty()), model.tabs.get_mut(model.active_tab)) {
+        tab.name = name;
+    }
     Ok(())
 }
 
@@ -422,7 +438,8 @@ pub fn load_composition(model: &mut Model, win: Rect, path: &std::path::Path) ->
 fn restore_body(saved: SavedModule, cameras: &[CameraInfo]) -> ModuleBody {
     let mut chrome = ModuleChrome::new();
     chrome.minimized = saved.minimized;
-    chrome.show_preview = saved.show_preview;
+    // Only modules that carry video have a preview to show.
+    chrome.show_preview = saved.show_preview && crate::modules::has_video_preview(saved.kind);
 
     let body = match saved.kind {
         ModuleKind::Camera => {
@@ -438,7 +455,7 @@ fn restore_body(saved: SavedModule, cameras: &[CameraInfo]) -> ModuleBody {
             }
             ModuleBody::Camera(cam)
         }
-        ModuleKind::Blend => {
+        ModuleKind::Blend | ModuleKind::Stack => {
             let mut blend = BlendState::new();
             blend.chrome = chrome;
             blend.mix = restore_param(saved.param, saved.mix, blend.mix);
@@ -495,6 +512,12 @@ fn restore_body(saved: SavedModule, cameras: &[CameraInfo]) -> ModuleBody {
             w.pin = saved.wled_pin;
             w.raw_max = restore_param(saved.param, None, w.raw_max);
             ModuleBody::Wled(w)
+        }
+        ModuleKind::Osc => {
+            let mut osc = OscState::new();
+            osc.chrome = chrome;
+            restore_fields(&mut osc.fields, &saved.fields);
+            ModuleBody::Osc(osc)
         }
         ModuleKind::Lag => {
             let mut lag = LagState::new();
@@ -586,6 +609,18 @@ fn finish_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_examples_parse() {
+        for example in crate::examples::all() {
+            let file: SaveFile = serde_json::from_str(example.json).unwrap_or_else(|e| panic!("{}: {e}", example.name));
+            assert!(file.modules.iter().any(|m| m.kind == ModuleKind::Output), "{}: no Output", example.name);
+            for c in &file.connections {
+                assert!(file.modules.iter().any(|m| m.id == c.from), "{}: dangling cable", example.name);
+                assert!(file.modules.iter().any(|m| m.id == c.to), "{}: dangling cable", example.name);
+            }
+        }
+    }
 
     fn snippet_of(json: &str) -> Snippet {
         serde_json::from_str(json).unwrap()

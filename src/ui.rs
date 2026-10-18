@@ -24,9 +24,9 @@ const fn ca(hex: u32, alpha: u8) -> Color {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Palette {
-    #[default]
     Dark,
     Light,
+    #[default]
     Midnight,
     Warm,
 }
@@ -90,7 +90,7 @@ impl Theme {
     pub fn module(&self, kind: ModuleKind) -> Color {
         match kind {
             ModuleKind::Camera | ModuleKind::Video => self.camera,
-            ModuleKind::Blend => self.blend,
+            ModuleKind::Blend | ModuleKind::Stack => self.blend,
             ModuleKind::Shader | ModuleKind::Generator | ModuleKind::Effect | ModuleKind::Feedback | ModuleKind::ShaderMix => {
                 self.shader
             }
@@ -100,6 +100,7 @@ impl Theme {
             | ModuleKind::Lfo
             | ModuleKind::Lag
             | ModuleKind::Map
+            | ModuleKind::Osc
             | ModuleKind::Wled => self.math,
         }
     }
@@ -345,6 +346,32 @@ pub fn label_left(draw: &Draw, rect: Rect, text: &str, color: Color, size: u32) 
         .font_size(size);
 }
 
+/// Width in pixels of `text` at font `size`, as `label_left` lays it out.
+pub fn text_width(text: &str, size: u32) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    nannou::text::text(text)
+        .font_size(size)
+        .no_line_wrap()
+        .left_justify()
+        .build(Rect::from_w_h(100_000.0, 100.0))
+        .width()
+}
+
+/// Which gap between characters of `text` is closest to `x`, measured from
+/// where `label_left` starts drawing: the caret position for a click there.
+pub fn caret_at(text: &str, size: u32, x: f32) -> usize {
+    let n = text.chars().count();
+    (0..=n)
+        .min_by(|a, b| {
+            let da = (text_width(&text.chars().take(*a).collect::<String>(), size) - x).abs();
+            let db = (text_width(&text.chars().take(*b).collect::<String>(), size) - x).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(n)
+}
+
 /// Numbers shown in boxes: two decimals, one once they get big.
 pub fn fmt_num(v: f32) -> String {
     if v.abs() >= 100.0 {
@@ -383,13 +410,44 @@ pub fn selector_sized(draw: &Draw, t: &Theme, rect: Rect, text: &str, hovered: b
 /// A number box: a bar showing where the value sits in its range (always
 /// inside the box), its text, and a caret while it's being typed into.
 /// `driven` boxes are fed by a cable and drawn as a dimmer readout.
+/// Text being typed: where the caret is and what part is selected.
+#[derive(Clone, Copy)]
+pub struct EditView<'a> {
+    pub text: &'a str,
+    pub cursor: usize,
+    pub selection: Option<(usize, usize)>,
+}
+
+/// Highlight behind the selected characters of `text`, which starts at `left`.
+pub fn selection_highlight(draw: &Draw, t: &Theme, view: EditView, left: f32, y: f32, h: f32, size: u32) {
+    let Some((a, b)) = view.selection else { return };
+    let x = |n: usize| left + text_width(&view.text.chars().take(n).collect::<String>(), size);
+    let (x0, x1) = (x(a), x(b));
+    let mut fill = t.accent;
+    fill.alpha = 110;
+    draw.rect().x_y((x0 + x1) / 2.0, y).w_h(x1 - x0, h).color(fill);
+}
+
+/// A left-aligned text field's contents while being edited, as `label_left`
+/// lays them out: selection highlight, text and caret.
+pub fn edit_label_left(draw: &Draw, t: &Theme, rect: Rect, view: EditView, color: Color, size: u32, caret: bool) {
+    let left = rect.left() + 10.0;
+    selection_highlight(draw, t, view, left, rect.y(), size as f32 * 1.4, size);
+    label_left(draw, rect, view.text, color, size);
+    if caret {
+        let before: String = view.text.chars().take(view.cursor).collect();
+        let x = left + text_width(&before, size);
+        draw.line().start(pt2(x, rect.y() - size as f32 * 0.6)).end(pt2(x, rect.y() + size as f32 * 0.6)).weight(1.5).color(color);
+    }
+}
+
 pub struct ValueBox<'a> {
     pub norm: f32,
     pub text: &'a str,
     pub driven: bool,
     pub hovered: bool,
-    /// What's typed so far, while editing.
-    pub editing: Option<&'a str>,
+    /// What's typed so far and where the caret sits (in characters), while editing.
+    pub editing: Option<EditView<'a>>,
     pub caret: bool,
 }
 
@@ -407,9 +465,15 @@ pub fn value_box(draw: &Draw, t: &Theme, rect: Rect, v: ValueBox, font: u32) {
     let border = if editing { t.accent } else { t.border };
     rounded_outline(draw, rect, RADIUS, border, if editing { 2.0 } else { 1.0 });
     match v.editing {
-        Some(typed) => {
-            let text = format!("{typed}{}", if v.caret { "|" } else { " " });
-            label(draw, rect, &text, t.field_text, font);
+        Some(view) => {
+            let left = rect.x() - text_width(view.text, font) / 2.0;
+            selection_highlight(draw, t, view, left, rect.y(), rect.h() * 0.6, font);
+            label(draw, rect, view.text, t.field_text, font);
+            if v.caret {
+                let before: String = view.text.chars().take(view.cursor).collect();
+                let x = left + text_width(&before, font);
+                draw.line().start(pt2(x, rect.y() - rect.h() * 0.28)).end(pt2(x, rect.y() + rect.h() * 0.28)).weight(1.5).color(t.field_text);
+            }
         }
         None => label(draw, rect, v.text, t.field_text, font),
     }

@@ -21,6 +21,8 @@ ffmpeg-next = { version = "9", default-features = false, features = ["codec", "f
 
 # Resolves wgpu's error-scope future (ready immediately on native).
 pollster = "0.4"
+# Text copy/paste in the text fields and number boxes.
+arboard = { version = "3.7", default-features = false }
 
 [profile.release]
 opt-level = 3

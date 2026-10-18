@@ -70,6 +70,8 @@ pub struct BlendState {
     pub dropdown_open: bool,
     uniform: Option<wgpu::Buffer>,
     target: Option<VideoTex>,
+    /// Second render target a Stack ping-pongs with `target`.
+    scratch: Option<VideoTex>,
 }
 
 impl BlendState {
@@ -81,6 +83,7 @@ impl BlendState {
             dropdown_open: false,
             uniform: None,
             target: None,
+            scratch: None,
         }
     }
 
@@ -111,5 +114,39 @@ impl BlendState {
         let target = ensure_target(device, &mut self.target, a.width, a.height);
         pipeline.record(device, encoder, uniform, &a, &b, &target);
         Some(target)
+    }
+
+    /// A Stack: folds any number of layers, bottom first, each blended over
+    /// what's below with the same mode and mix. One layer passes through
+    /// untouched; the output takes the bottom layer's resolution.
+    pub fn record_stack(
+        &mut self,
+        pipeline: &BlendPipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        layers: Vec<VideoTex>,
+        mix: f32,
+    ) -> Option<VideoTex> {
+        let mut layers = layers.into_iter();
+        let mut acc = layers.next()?;
+        let rest: Vec<VideoTex> = layers.collect();
+        if rest.is_empty() {
+            return Some(acc);
+        }
+        let uniform = self.uniform.get_or_insert_with(|| uniform_buffer(device, 16));
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&mix.clamp(0.0, 1.0).to_ne_bytes());
+        bytes[4..8].copy_from_slice(&self.mode.index().to_ne_bytes());
+        queue.write_buffer(uniform, 0, &bytes);
+
+        let (w, h) = (acc.width, acc.height);
+        let targets = [ensure_target(device, &mut self.target, w, h), ensure_target(device, &mut self.scratch, w, h)];
+        for (i, layer) in rest.iter().enumerate() {
+            let dst = &targets[i % 2];
+            pipeline.record(device, encoder, uniform, &acc, layer, dst);
+            acc = dst.clone();
+        }
+        Some(acc)
     }
 }

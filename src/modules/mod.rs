@@ -1,6 +1,7 @@
 pub mod effects;
 pub mod math;
 pub mod mix;
+pub mod multi_input;
 pub mod output;
 pub mod param;
 pub mod sources;
@@ -14,6 +15,7 @@ use math::{
     map::MapState,
     mult::MultState,
     number::NumberState,
+    osc::OscState,
 };
 use mix::blend::BlendState;
 use nannou::prelude::*;
@@ -54,6 +56,9 @@ pub enum ModuleKind {
     Effect,
     Feedback,
     ShaderMix,
+    /// Blend with one multi-cable video input (any number of layers).
+    Stack,
+    Osc,
 }
 
 impl ModuleKind {
@@ -95,7 +100,7 @@ pub const CATEGORIES: &[(&str, &[(&str, ModuleKind)])] = &[
             ("WLED", ModuleKind::Wled),
         ],
     ),
-    ("Mix", &[("Blend", ModuleKind::Blend)]),
+    ("Mix", &[("Blend", ModuleKind::Blend), ("Stack", ModuleKind::Stack)]),
     (
         "Math",
         &[
@@ -135,6 +140,8 @@ pub fn kind_label(kind: ModuleKind) -> &'static str {
         ModuleKind::Effect => "Effect",
         ModuleKind::Feedback => "Feedback",
         ModuleKind::ShaderMix => "Shader Mix",
+        ModuleKind::Stack => "Stack",
+        ModuleKind::Osc => "OSC",
     }
 }
 
@@ -149,9 +156,12 @@ pub fn input_types(kind: ModuleKind) -> &'static [PortType] {
         | ModuleKind::Generator
         | ModuleKind::Effect
         | ModuleKind::Feedback
-        | ModuleKind::ShaderMix => &[],
+        | ModuleKind::ShaderMix
+        | ModuleKind::Osc => &[],
         // The third input drives the mix; it overrides the slider while plugged.
         ModuleKind::Blend => &[PortType::Video, PortType::Video, PortType::Number],
+        // Port 0 takes any number of cables (see `multi_input`); port 1 drives the mix.
+        ModuleKind::Stack => &[PortType::Video, PortType::Number],
         ModuleKind::Output => &[PortType::Video],
         ModuleKind::Mult => &[PortType::Number, PortType::Number],
         ModuleKind::Lag | ModuleKind::Map => &[PortType::Number],
@@ -167,6 +177,7 @@ pub fn output_type(kind: ModuleKind) -> Option<PortType> {
         ModuleKind::Camera
         | ModuleKind::Video
         | ModuleKind::Blend
+        | ModuleKind::Stack
         | ModuleKind::Shader
         | ModuleKind::Generator
         | ModuleKind::Effect
@@ -178,6 +189,7 @@ pub fn output_type(kind: ModuleKind) -> Option<PortType> {
         | ModuleKind::Lfo
         | ModuleKind::Lag
         | ModuleKind::Map
+        | ModuleKind::Osc
         | ModuleKind::Wled => Some(PortType::Number),
     }
 }
@@ -198,6 +210,8 @@ pub fn has_config_row(kind: ModuleKind) -> bool {
         ModuleKind::Camera
         | ModuleKind::Video
         | ModuleKind::Blend
+        | ModuleKind::Stack
+        | ModuleKind::Osc
         | ModuleKind::Number
         | ModuleKind::Lfo
         | ModuleKind::Lag
@@ -220,7 +234,9 @@ pub fn is_deletable(kind: ModuleKind) -> bool {
 pub fn base_height(kind: ModuleKind) -> f32 {
     match kind {
         // A second row with a mode selector (LFO wave, blend mode, lag curve).
-        ModuleKind::Lfo | ModuleKind::Blend | ModuleKind::Lag => 126.0,
+        ModuleKind::Lfo | ModuleKind::Blend | ModuleKind::Stack | ModuleKind::Lag => 126.0,
+        // Port and scale boxes, then the last-message readout.
+        ModuleKind::Osc => 126.0,
         // File, speed, transport and the scrub bar.
         ModuleKind::Video => 180.0,
         // Two rows of range fields, bias and calibrate, the toggles, the readout.
@@ -262,6 +278,7 @@ pub enum ModuleBody {
     Map(MapState),
     Wled(WledState),
     Shader(ShaderState),
+    Osc(OscState),
 }
 
 impl ModuleBody {
@@ -278,6 +295,7 @@ impl ModuleBody {
             ModuleBody::Map(s) => &s.chrome,
             ModuleBody::Wled(s) => &s.chrome,
             ModuleBody::Shader(s) => &s.chrome,
+            ModuleBody::Osc(s) => &s.chrome,
         }
     }
 
@@ -294,6 +312,7 @@ impl ModuleBody {
             ModuleBody::Map(s) => &mut s.chrome,
             ModuleBody::Wled(s) => &mut s.chrome,
             ModuleBody::Shader(s) => &mut s.chrome,
+            ModuleBody::Osc(s) => &mut s.chrome,
         }
     }
 }
@@ -347,7 +366,8 @@ pub fn push_module(modules: &mut Vec<PlacedModule>, next_id: &mut u64, kind: Mod
     let body = match kind {
         ModuleKind::Camera => ModuleBody::Camera(CameraState::new()),
         ModuleKind::Video => ModuleBody::Video(VideoState::new()),
-        ModuleKind::Blend => ModuleBody::Blend(BlendState::new()),
+        ModuleKind::Blend | ModuleKind::Stack => ModuleBody::Blend(BlendState::new()),
+        ModuleKind::Osc => ModuleBody::Osc(OscState::new()),
         ModuleKind::Output => ModuleBody::Output(OutputState::new()),
         ModuleKind::Number => ModuleBody::Number(NumberState::new()),
         ModuleKind::Mult => ModuleBody::Mult(MultState::new()),
@@ -400,6 +420,8 @@ pub fn module_number(
             .map(|x| map.apply(x)),
         // Refreshed from the device every tick in `update`.
         ModuleBody::Wled(wled) => wled.output(),
+        // Updated from the socket every tick in `update`.
+        ModuleBody::Osc(osc) => osc.output(),
         ModuleBody::Mult(_) => {
             let a = input_source(connections, id, 0)
                 .and_then(|src| module_number(modules, connections, src, now, visiting));

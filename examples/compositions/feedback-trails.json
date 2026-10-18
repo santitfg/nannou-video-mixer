@@ -1,0 +1,51 @@
+{
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        680.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    },
+    {
+      "id": 1,
+      "kind": "generator",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "voronoi.glsl",
+      "shader_category": "Generators"
+    },
+    {
+      "id": 2,
+      "kind": "feedback",
+      "pos": [
+        340.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "feedback.glsl",
+      "shader_category": "Feedback"
+    }
+  ],
+  "connections": [
+    {
+      "from": 1,
+      "to": 2,
+      "to_input": 0
+    },
+    {
+      "from": 2,
+      "to": 0,
+      "to_input": 0
+    }
+  ]
+}

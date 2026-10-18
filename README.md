@@ -44,112 +44,43 @@ Install these once with the setup script for your platform, then `cargo run`:
 | macOS | `./scripts/setup-macos.sh` |
 | Windows 11 | `powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1` (then open a new terminal) |
 
-Build scripts live in `scripts/` and produce binaries under `dist/<platform>/`. All are run from Linux.
+Build scripts live in `scripts/` and produce a folder under `dist/<platform>/` with the binary **and the `shaders/` folder** (the program reads `./shaders` at run time, so keep them together; the examples are inside the binary). Each script builds for the system it runs on, and tells you what to do instead when it can't:
 
-### Linux (native)
-
-```
-./scripts/build-linux.sh
-```
-
-Output: `dist/linux/nannou_sketch`
-
-### Windows (cross-compile)
-
-Requires the mingw-w64 toolchain:
-
-```
-sudo apt install mingw-w64
-./scripts/build-windows.sh
-```
-
-Output: `dist/windows/nannou_sketch.exe`
+| Script | Runs on | Output |
+|---|---|---|
+| `./scripts/build-macos.sh` | macOS (native), or Linux with osxcross | `dist/macos/` |
+| `./scripts/build-linux.sh` | Linux | `dist/linux/` |
+| `./scripts/build-windows.sh` | Windows (Git Bash, native MSVC) or Linux (mingw-w64 cross) | `dist/windows/` |
+| `./scripts/build-all.sh` | anywhere | everything the machine can build, skipping the rest |
 
 ### macOS
 
-Cross-compiling for macOS from Linux requires the Apple SDK via [osxcross](https://github.com/tpoechtrager/osxcross), which can't be obtained legally without owning a Mac. If you have osxcross set up, `./scripts/build-macos.sh` will use it.
-
-Otherwise, build a real macOS binary with no local macOS toolchain by pushing to GitHub and running the included workflow (`.github/workflows/release.yml`), which builds on a `macos-latest` runner — trigger it manually from the Actions tab or by pushing a `v*` tag.
-
-### All at once
+On a Mac, after `./scripts/setup-macos.sh`:
 
 ```
-./scripts/build-all.sh
+./scripts/build-macos.sh              # your architecture (Apple Silicon or Intel)
+./scripts/build-macos.sh --arm64      # Apple Silicon
+./scripts/build-macos.sh --x86_64     # Intel
+./scripts/build-macos.sh --universal  # both in one binary (lipo)
 ```
 
-Builds Linux and Windows, and macOS if osxcross is available; otherwise skips it with a pointer to the GitHub Actions workflow.
-# nannou-video-mixer
+Output: `dist/macos/nannou_sketch` plus `dist/macos/shaders/`. Run it from that folder (`cd dist/macos && ./nannou_sketch`).
 
-## Controls
+### macOS app and .dmg
 
-| Action | How |
-|---|---|
-| Add a module | Click its row in the sidebar (scroll the sidebar with the wheel) |
-| Select | Click a module; Shift+click adds/removes; drag on empty canvas for a rectangle (Cmd/Ctrl or Shift adds) |
-| Move | Drag a module (moves the whole selection) or a group's title bar |
-| Pan / zoom | Mouse wheel zooms at the cursor (Shift+wheel pans sideways); two-finger scroll pans (Cmd/Ctrl+scroll or pinch zooms); middle-drag or Shift+drag on empty canvas pans; `+` `-` `0` zoom; `H` recenters |
-| Number box | Drag to adjust (Shift = fine), click to type, right-click for range / clamp |
-| Copy / cut / paste | Cmd/Ctrl + `C` / `X` / `V` (pastes under the mouse) |
-| Duplicate | `D` or Cmd/Ctrl+`D` |
-| Delete | `Delete` / `Backspace` |
-| Select all | Cmd/Ctrl+`A` |
-| Group / ungroup | Cmd/Ctrl+`G` / Cmd/Ctrl+Shift+`G`; double-click a group's title to rename it, the star saves it to **My groups** in the sidebar (right-click there to remove it) |
-| Auto layout | `L`, or right-click the canvas for row / column arrangements |
-| Previews / minimize | `P` hides (or shows) all previews, `M` minimizes (or expands) all |
-| Context menu | Right-click the canvas or a module |
-| Fullscreen | `F`; leave with a click, `Esc`, `Space`, `Enter` or `F` |
+```
+./scripts/build-dmg.sh              # your architecture
+./scripts/build-dmg.sh --universal  # Apple Silicon + Intel
+```
 
-Layout commands, `P` and `M` act on the selection when two or more modules are selected, otherwise on everything.
+Builds `dist/macos/Video Mixer.app` (with the icon from `assets/icon.icns`) and `dist/Video-Mixer-<version>-<arch>.dmg`, a disk image with an Applications shortcut. A double-clicked app has `/` as its working directory, so the app starts through a small launcher that works inside `~/Library/Application Support/Video Mixer/`: shaders (seeded from the bundle, your edits are kept), settings, presets and the last session live there. The bundle is signed ad hoc, which is enough to run it on the Mac that built it and to ask for camera access; for other people's Macs it needs a Developer ID signature and notarization (otherwise right-click → Open the first time).
 
-## Video
+The icon is drawn by `scripts/make-icon.py` (standard-library Python); edit it and run it to regenerate `assets/icon.png` and `assets/icon.icns`.
 
-**Sources → Video** (or drop a video file on the window) plays a file with a
-variable-speed playhead: **Speed** goes from -4x to 4x (negative plays
-backwards), the transport row has play/pause and Loop / Ping-pong / Once, and
-the bar under it scrubs. Both Speed and the scrub position have input ports, so
-an LFO or a Lag can drive them.
+### Linux and Windows
 
-How it stays fast and bounded:
+Linux needs a Linux machine (`./scripts/build-linux.sh`). Windows builds natively from Git Bash after `setup-windows.ps1`, or cross-compiles from Linux with `sudo apt install mingw-w64`.
 
-* Decoding runs on its own thread per video (like cameras), with FFmpeg's
-  frame/slice threading. The render loop only uploads.
-* Frames are kept as YUV 4:2:0 (1.5 bytes/pixel) and converted to RGB on the
-  GPU. Anything taller than 1080p is scaled down while decoding.
-* Each video has a 256 MB frame cache; the frames farthest from the playhead
-  are evicted first. Playing backwards seeks to the previous keyframe, decodes
-  forward through that GOP and serves it in reverse, preparing the previous
-  GOP before the playhead gets there.
-* A Video module that isn't connected to Output (and has no preview) stops
-  its decoder and frees its cache.
+### Other platforms: GitHub Actions
 
-Long-GOP files (typical H.264/H.265 from phones and cameras) scrub and reverse
-fine, but every backwards GOP costs one decode pass. Intra-only codecs
-(ProRes, DNxHD, MJPEG, HAP-like) are cheapest for heavy scrubbing.
-
-**Possible future change:** transcode on import to an intra-only proxy (kept
-in memory or on disk, via `ffmpeg-next`) so every frame is a keyframe —
-instant scrubbing/reverse on any file, at the cost of an import step and
-proxy storage.
-
-## WLED controllers
-
-**Sources → WLED** reads the inputs of a [WLED](https://kno.wled.ge)
-controller — potentiometers on analog pins, touch pads, buttons and switches,
-as configured in WLED's *LED & Hardware* settings — and sends one of them down
-its cable as a 0..1 number.
-
-* The box lists every input the device reports, with an activity light (lit
-  while it moves or is pressed), a level bar and the raw reading. Click a row
-  to choose which input the box outputs. **Raw max** is the full-scale
-  reading: 4095 for ESP32 (default), 1023 for ESP8266.
-* The **WLED** button at the bottom of the sidebar opens the controllers
-  panel: every tracked device with its connection state (online / connecting
-  / no data / error) and input count, **Scan network** (mDNS, in the
-  background), add by IP or host name, remove, and the poll rate. The light
-  on the button sums them up. Devices are remembered between runs.
-* Polling runs on background threads (one per device, 2 s timeout), so a
-  slow or missing device never stalls the picture.
-
-For range conversion, **Math → Map** rescales a number from one range to
-another (optionally clamped to the output range) and **Math → Clamp** holds it
-between a minimum and a maximum; both show input → output live.
+Cross-compiling a GUI app for another OS needs that OS's SDK, so the reliable way to get every platform from one machine is the included workflow (`.github/workflows/release.yml`): it builds Linux, Windows and macOS (Apple Silicon and Intel) on their own runners. Trigger it from the Actions tab or by pushing a `v*` tag, then download the artifacts.

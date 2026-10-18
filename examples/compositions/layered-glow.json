@@ -1,0 +1,102 @@
+{
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        1020.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    },
+    {
+      "id": 1,
+      "kind": "generator",
+      "pos": [
+        0.0,
+        -380.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "noise.glsl",
+      "shader_category": "Generators"
+    },
+    {
+      "id": 2,
+      "kind": "generator",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "plasma.glsl",
+      "shader_category": "Generators"
+    },
+    {
+      "id": 3,
+      "kind": "generator",
+      "pos": [
+        0.0,
+        380.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "ripples.glsl",
+      "shader_category": "Generators"
+    },
+    {
+      "id": 4,
+      "kind": "stack",
+      "pos": [
+        340.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "mix": 0.6,
+      "blend_mode": "screen"
+    },
+    {
+      "id": 5,
+      "kind": "effect",
+      "pos": [
+        680.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "bloom.glsl",
+      "shader_category": "Blur & Glow"
+    }
+  ],
+  "connections": [
+    {
+      "from": 1,
+      "to": 4,
+      "to_input": 0
+    },
+    {
+      "from": 2,
+      "to": 4,
+      "to_input": 0
+    },
+    {
+      "from": 3,
+      "to": 4,
+      "to_input": 0
+    },
+    {
+      "from": 4,
+      "to": 5,
+      "to_input": 0
+    },
+    {
+      "from": 5,
+      "to": 0,
+      "to_input": 0
+    }
+  ]
+}

@@ -1,55 +1,63 @@
 #!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
-
-TARGET="x86_64-apple-darwin"
-
-# Cross-compiling a GUI app (nannou links Cocoa/Metal via winit + wgpu) for
-# macOS from Linux requires the real Apple SDK, provided through osxcross.
-# There is no legal way to download that SDK except by extracting it from
-# Xcode on a Mac you (or your org) own, so this script only works if you
-# already set up osxcross locally.
+# macOS binary. On a Mac this is a plain native build (the Apple toolchain is
+# already there); from Linux it needs osxcross.
 #
-# Reliable alternatives, in order of preference:
-#   1. Build on a real Mac (`./scripts/build-linux.sh` equivalent there,
-#      target is just the host).
-#   2. Use the GitHub Actions workflow at .github/workflows/release.yml,
-#      which builds on an actual macos-latest runner. This is the
-#      recommended path and needs no local macOS toolchain at all.
-#   3. Set up osxcross yourself and point OSXCROSS_ROOT at it, then re-run
-#      this script.
+#   ./scripts/build-macos.sh              host architecture (Apple Silicon -> arm64, Intel -> x86_64)
+#   ./scripts/build-macos.sh --arm64      Apple Silicon
+#   ./scripts/build-macos.sh --x86_64     Intel
+#   ./scripts/build-macos.sh --universal  both, joined with lipo into one binary
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+cd "$ROOT"
 
-if [ -z "${OSXCROSS_ROOT:-}" ] || ! command -v x86_64-apple-darwin-clang >/dev/null 2>&1; then
-  cat >&2 <<'EOF'
-error: osxcross toolchain not found (no x86_64-apple-darwin-clang on PATH
-and/or OSXCROSS_ROOT is unset).
+ARM="aarch64-apple-darwin"
+INTEL="x86_64-apple-darwin"
 
-Cross-compiling for macOS from Linux needs the Apple SDK via osxcross,
-which this machine doesn't have set up. Use one of:
-  - GitHub Actions: .github/workflows/release.yml builds a real macOS
-    binary on a macos-latest runner, no local setup required.
-  - Build directly on a Mac.
-  - Install osxcross (https://github.com/tpoechtrager/osxcross) with a
-    legally obtained macOS SDK, export OSXCROSS_ROOT, and re-run this
-    script.
-EOF
-  exit 1
-fi
+case "$(host_os)" in
+  macos)
+    command -v xcode-select >/dev/null && xcode-select -p >/dev/null 2>&1 || {
+      echo "error: Xcode Command Line Tools missing. Run ./scripts/setup-macos.sh" >&2
+      exit 1
+    }
+    case "${1:-}" in
+      --arm64) MODE=$ARM ;;
+      --x86_64) MODE=$INTEL ;;
+      --universal) MODE=universal ;;
+      "") [ "$(uname -m)" = "arm64" ] && MODE=$ARM || MODE=$INTEL ;;
+      *) echo "usage: $0 [--arm64 | --x86_64 | --universal]" >&2; exit 2 ;;
+    esac
 
-export CC_x86_64_apple_darwin="x86_64-apple-darwin-clang"
-export CXX_x86_64_apple_darwin="x86_64-apple-darwin-clang++"
-export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="x86_64-apple-darwin-clang"
+    if [ "$MODE" = "universal" ]; then
+      for t in $ARM $INTEL; do
+        ensure_target "$t"
+        echo "==> Building for macOS ($t)"
+        cargo build --release --target "$t"
+      done
+      mkdir -p target/universal
+      lipo -create -output "target/universal/$BIN" "target/$ARM/release/$BIN" "target/$INTEL/release/$BIN"
+      package macos "target/universal/$BIN"
+    else
+      ensure_target "$MODE"
+      echo "==> Building for macOS ($MODE)"
+      cargo build --release --target "$MODE"
+      package macos "target/$MODE/release/$BIN"
+    fi
+    ;;
 
-if ! rustup target list --installed | grep -q "^${TARGET}\$"; then
-  echo "==> Adding rust target $TARGET"
-  rustup target add "$TARGET"
-fi
+  linux)
+    # Cross-compiling a GUI app (winit + wgpu link Cocoa/Metal) needs the real
+    # Apple SDK through osxcross; it can only be extracted from Xcode on a Mac.
+    if [ -z "${OSXCROSS_ROOT:-}" ] || ! command -v x86_64-apple-darwin-clang >/dev/null 2>&1; then
+      only_on macOS "a Mac (or set up osxcross and export OSXCROSS_ROOT)"
+    fi
+    export CC_x86_64_apple_darwin="x86_64-apple-darwin-clang"
+    export CXX_x86_64_apple_darwin="x86_64-apple-darwin-clang++"
+    export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="x86_64-apple-darwin-clang"
+    ensure_target "$INTEL"
+    echo "==> Building for macOS ($INTEL, osxcross)"
+    cargo build --release --target "$INTEL"
+    package macos "target/$INTEL/release/$BIN"
+    ;;
 
-echo "==> Building for macOS ($TARGET)"
-cargo build --release --target "$TARGET"
-
-OUT_DIR="dist/macos"
-mkdir -p "$OUT_DIR"
-cp "target/$TARGET/release/nannou_sketch" "$OUT_DIR/"
-
-echo "==> Done: $OUT_DIR/nannou_sketch"
+  *) only_on macOS "a Mac" ;;
+esac
