@@ -1,3 +1,5 @@
+// @category Stylize
+// @role effect
 // Old CRT monitor: curved glass, scanlines, phosphor mask, vignette and noise.
 Properties {
     _Scanlines ("Scanlines", Range(0, 1)) = 0.5

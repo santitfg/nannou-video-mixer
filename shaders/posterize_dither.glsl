@@ -1,3 +1,5 @@
+// @category Color
+// @role effect
 // Retro posterize with ordered (Bayer 4x4) dithering: few colors, smooth
 // gradients. Palette picks the color set the levels are drawn from.
 Properties {

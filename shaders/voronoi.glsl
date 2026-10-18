@@ -1,3 +1,5 @@
+// @category Generators
+// @role generator
 // Voronoi / cellular generator (no input): flat cells, glowing edges,
 // distance field, or cracked "crackle" lines. Cells drift with Speed.
 Properties {

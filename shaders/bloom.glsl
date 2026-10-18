@@ -1,3 +1,5 @@
+// @category Blur & Glow
+// @role effect
 // Glow: the brightest parts bleed light into their surroundings.
 Properties {
     _Threshold ("Threshold", Range(0, 1)) = 0.6

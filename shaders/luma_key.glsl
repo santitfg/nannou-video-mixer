@@ -1,3 +1,5 @@
+// @category Key
+// @role effect
 // Keeps the bright (or dark) parts and blacks out the rest; Matte shows the
 // mask itself. Pair it with Blend in Add/Screen to layer the result.
 Properties {

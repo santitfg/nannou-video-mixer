@@ -1,3 +1,5 @@
+// @category Generators
+// @role generator
 // Noise generator (no input): smooth value noise, fractal clouds, ridged
 // mountains-like lines, turbulent marble, or plain TV static.
 Properties {

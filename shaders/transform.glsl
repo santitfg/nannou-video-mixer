@@ -1,3 +1,5 @@
+// @category Distortion
+// @role effect
 // Zoom, rotate and move the image. Outside the edges: black, repeat or mirror.
 Properties {
     _Zoom    ("Zoom", Range(0.1, 5)) = 1.0

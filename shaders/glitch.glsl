@@ -1,3 +1,5 @@
+// @category Glitch
+// @role effect
 // Digital glitch: displaced blocks, torn lines, RGB split and inverted flashes.
 Properties {
     _Amount ("Amount", Range(0, 1)) = 0.5

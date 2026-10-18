@@ -1,3 +1,5 @@
+// @category Stylize
+// @role effect
 // Sobel edges: plain white lines, rainbow neon, or dark pencil lines on white.
 Properties {
     _Mode     ("Mode", Enum(Edges, Neon, Sketch)) = 0

@@ -1,3 +1,5 @@
+// @category Glitch
+// @role effect
 // Splits the red and blue channels apart. Feed video into iChannel0.
 Properties {
     _Amount ("Amount", Range(0, 0.1)) = 0.01

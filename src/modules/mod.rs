@@ -7,6 +7,7 @@ pub mod sources;
 
 use crate::ModuleChrome;
 use effects::shader::ShaderState;
+use effects::shader_file::ShaderRole;
 use math::{
     lag::LagState,
     lfo::LfoState,
@@ -45,11 +46,54 @@ pub enum ModuleKind {
     Map,
     Clamp,
     Wled,
+    /// Legacy catch-all shader node (lists every shader); kept so old
+    /// compositions load. New nodes use the role-specific kinds below.
     Shader,
+    Generator,
+    Effect,
+    Feedback,
+    ShaderMix,
+}
+
+impl ModuleKind {
+    /// Whether this kind is backed by a shader file.
+    pub fn is_shader(self) -> bool {
+        self.shader_role().is_some()
+    }
+
+    /// Which shaders this kind lists in its dropdown.
+    pub fn shader_role(self) -> Option<ShaderRole> {
+        match self {
+            ModuleKind::Shader => Some(ShaderRole::Any),
+            ModuleKind::Generator => Some(ShaderRole::Generator),
+            ModuleKind::Effect => Some(ShaderRole::Effect),
+            ModuleKind::Feedback => Some(ShaderRole::Feedback),
+            ModuleKind::ShaderMix => Some(ShaderRole::Mix),
+            _ => None,
+        }
+    }
+
+    /// The node to create for a shader file of the given role.
+    pub fn for_shader_role(role: ShaderRole) -> ModuleKind {
+        match role {
+            ShaderRole::Any => ModuleKind::Shader,
+            ShaderRole::Generator => ModuleKind::Generator,
+            ShaderRole::Effect => ModuleKind::Effect,
+            ShaderRole::Feedback => ModuleKind::Feedback,
+            ShaderRole::Mix => ModuleKind::ShaderMix,
+        }
+    }
 }
 
 pub const CATEGORIES: &[(&str, &[(&str, ModuleKind)])] = &[
-    ("Sources", &[("Camera", ModuleKind::Camera), ("Video", ModuleKind::Video), ("WLED", ModuleKind::Wled)]),
+    (
+        "Sources",
+        &[
+            ("Camera", ModuleKind::Camera),
+            ("Video", ModuleKind::Video),
+            ("WLED", ModuleKind::Wled),
+        ],
+    ),
     ("Mix", &[("Blend", ModuleKind::Blend)]),
     (
         "Math",
@@ -62,7 +106,8 @@ pub const CATEGORIES: &[(&str, &[(&str, ModuleKind)])] = &[
             ("Clamp", ModuleKind::Clamp),
         ],
     ),
-    ("Effects", &[("Shader", ModuleKind::Shader)]),
+    // Filled from the shaders folder, by category: see `sidebar_rows`.
+    ("Effects", &[]),
 ];
 
 /// The two kinds of signal a port can carry. Each palette gives them their
@@ -87,6 +132,10 @@ pub fn kind_label(kind: ModuleKind) -> &'static str {
         ModuleKind::Clamp => "Clamp",
         ModuleKind::Wled => "WLED",
         ModuleKind::Shader => "Shader",
+        ModuleKind::Generator => "Generator",
+        ModuleKind::Effect => "Effect",
+        ModuleKind::Feedback => "Feedback",
+        ModuleKind::ShaderMix => "Shader Mix",
     }
 }
 
@@ -94,7 +143,14 @@ pub fn kind_label(kind: ModuleKind) -> &'static str {
 pub fn input_types(kind: ModuleKind) -> &'static [PortType] {
     match kind {
         // Shader's ports depend on the file it loaded: see `PlacedModule::input_types`.
-        ModuleKind::Camera | ModuleKind::Number | ModuleKind::Lfo | ModuleKind::Shader => &[],
+        ModuleKind::Camera
+        | ModuleKind::Number
+        | ModuleKind::Lfo
+        | ModuleKind::Shader
+        | ModuleKind::Generator
+        | ModuleKind::Effect
+        | ModuleKind::Feedback
+        | ModuleKind::ShaderMix => &[],
         // The third input drives the mix; it overrides the slider while plugged.
         ModuleKind::Blend => &[PortType::Video, PortType::Video, PortType::Number],
         ModuleKind::Output => &[PortType::Video],
@@ -109,7 +165,14 @@ pub fn input_types(kind: ModuleKind) -> &'static [PortType] {
 /// The type of a module's single output port, or `None` if it has no output.
 pub fn output_type(kind: ModuleKind) -> Option<PortType> {
     match kind {
-        ModuleKind::Camera | ModuleKind::Video | ModuleKind::Blend | ModuleKind::Shader => Some(PortType::Video),
+        ModuleKind::Camera
+        | ModuleKind::Video
+        | ModuleKind::Blend
+        | ModuleKind::Shader
+        | ModuleKind::Generator
+        | ModuleKind::Effect
+        | ModuleKind::Feedback
+        | ModuleKind::ShaderMix => Some(PortType::Video),
         ModuleKind::Output => None,
         ModuleKind::Number
         | ModuleKind::Mult
@@ -144,7 +207,11 @@ pub fn has_config_row(kind: ModuleKind) -> bool {
         | ModuleKind::Clamp
         | ModuleKind::Wled
         | ModuleKind::Mult
-        | ModuleKind::Shader => true,
+        | ModuleKind::Shader
+        | ModuleKind::Generator
+        | ModuleKind::Effect
+        | ModuleKind::Feedback
+        | ModuleKind::ShaderMix => true,
         ModuleKind::Output => false,
     }
 }
@@ -296,7 +363,9 @@ pub fn push_module(modules: &mut Vec<PlacedModule>, next_id: &mut u64, kind: Mod
         ModuleKind::Map => ModuleBody::Map(MapState::new()),
         ModuleKind::Clamp => ModuleBody::Clamp(ClampState::new()),
         ModuleKind::Wled => ModuleBody::Wled(WledState::new()),
-        ModuleKind::Shader => ModuleBody::Shader(ShaderState::new()),
+        ModuleKind::Shader | ModuleKind::Generator | ModuleKind::Effect | ModuleKind::Feedback | ModuleKind::ShaderMix => {
+            ModuleBody::Shader(ShaderState::new())
+        }
     };
     let id = *next_id;
     modules.push(PlacedModule { id, kind, pos, body });

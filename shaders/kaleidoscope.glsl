@@ -1,3 +1,5 @@
+// @category Distortion
+// @role effect
 // Mirrors iChannel0 around the center into N wedges.
 Properties {
     _Segments ("Segments", Int) = 6

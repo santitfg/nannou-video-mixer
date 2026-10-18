@@ -1,3 +1,5 @@
+// @category Distortion
+// @role effect
 // Sine-wave displacement: rows sway, columns sway, or rings spread out.
 Properties {
     _Mode      ("Mode", Enum(Horizontal, Vertical, Radial)) = 0

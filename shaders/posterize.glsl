@@ -1,3 +1,5 @@
+// @category Color
+// @role effect
 // Reduces each channel to a few flat levels.
 Properties {
     _Levels ("Levels", Range(2, 16)) = 4.0

@@ -1,3 +1,5 @@
+// @category Feedback
+// @role feedback
 // Video feedback: the input mixed with this module's own previous frame
 // (iFeedback), zoomed/rotated a little every frame so trails drift.
 //   Classic    — the input over a fading copy of the last frame

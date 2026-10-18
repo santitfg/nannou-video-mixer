@@ -1,3 +1,5 @@
+// @category Color
+// @role effect
 // Hue / saturation / brightness / contrast, with an optional invert.
 Properties {
     _Hue        ("Hue", Range(-1, 1)) = 0.0

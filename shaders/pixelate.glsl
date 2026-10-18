@@ -1,3 +1,5 @@
+// @category Stylize
+// @role effect
 // Big square pixels. Size is in screen pixels.
 Properties {
     _Size ("Size", Range(1, 64)) = 8.0

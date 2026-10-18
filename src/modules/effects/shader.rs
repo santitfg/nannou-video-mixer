@@ -162,8 +162,22 @@ fn compile(device: &wgpu::Device, file: &str) -> Result<Compiled, String> {
 }
 
 fn compile_from_source(device: &wgpu::Device, source: &str) -> Result<Compiled, String> {
-    let (parsed, module) = front_end(source)?;
+    // naga's GLSL front end can panic on odd input: that's a shader error,
+    // not a crash.
+    let (parsed, module) = std::panic::catch_unwind(|| front_end(source))
+        .map_err(|_| "the shader compiler crashed on this file".to_string())??;
 
+    // wgpu reports validation failures through the device's error handler,
+    // which panics by default; catch them in a scope and show them instead.
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let compiled = build_pipeline(device, parsed, module);
+    match pollster::block_on(device.pop_error_scope()) {
+        Some(err) => Err(err.to_string()),
+        None => Ok(compiled),
+    }
+}
+
+fn build_pipeline(device: &wgpu::Device, parsed: ParsedShader, module: naga::Module) -> Compiled {
     let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("shader-fragment"),
         source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
@@ -245,7 +259,7 @@ fn compile_from_source(device: &wgpu::Device, source: &str) -> Result<Compiled, 
     // Freshly created textures are zero-filled, so this reads as transparent black.
     let placeholder = create_texture(device, 1, 1, wgpu::TextureUsages::TEXTURE_BINDING);
 
-    Ok(Compiled {
+    Compiled {
         channels: parsed.channels,
         feedback: parsed.feedback,
         gpu: Gpu {
@@ -259,7 +273,7 @@ fn compile_from_source(device: &wgpu::Device, source: &str) -> Result<Compiled, 
             current: 0,
         },
         props: parsed.props,
-    })
+    }
 }
 
 // --- Per-tick work ---------------------------------------------------------
@@ -331,6 +345,7 @@ impl ShaderState {
         values: Vec<f32>,
         time: f32,
         delta: f32,
+        max_height: Option<u32>,
     ) -> Option<VideoTex> {
         let frame = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
@@ -342,6 +357,11 @@ impl ShaderState {
             .map(|t| (t.width, t.height))
             .next()
             .unwrap_or(DEFAULT_SIZE);
+        // Thumbnail-only passes shrink to `max_height`, keeping the aspect.
+        let (width, height) = match max_height {
+            Some(cap) if height > cap => (((width as u64 * cap as u64) / height as u64).max(1) as u32, cap),
+            _ => (width, height),
+        };
         let gpu = &mut compiled.gpu;
         // Feedback shaders draw into the other target each frame; a size
         // change restarts both (black) so they never disagree.
@@ -457,14 +477,14 @@ mod tests {
         let values = compiled.props.iter().map(|p| p.default).collect();
         state.compiled = Some(compiled);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let out = state.record(device, queue, &mut encoder, inputs, values, 1.0, 0.016).unwrap();
+        let out = state.record(device, queue, &mut encoder, inputs, values, 1.0, 0.016, None).unwrap();
         queue.submit(Some(encoder.finish()));
         crate::gpu::read_back(device, queue, &out)
     }
 
     #[test]
     fn bundled_shaders_compile_and_render() {
-        let library = scan_library();
+        let library: Vec<String> = scan_library().into_iter().map(|i| i.file).collect();
         assert!(!library.is_empty(), "no shaders found in the shaders folder");
 
         let Some((device, queue)) = gpu() else {
@@ -531,7 +551,7 @@ mod tests {
         let mut reds = Vec::new();
         for _ in 0..3 {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            let out = state.record(&device, &queue, &mut encoder, &[], vec![], 0.0, 0.016).unwrap();
+            let out = state.record(&device, &queue, &mut encoder, &[], vec![], 0.0, 0.016, None).unwrap();
             queue.submit(Some(encoder.finish()));
             reds.push(crate::gpu::read_back(&device, &queue, &out)[0]);
         }

@@ -1,3 +1,5 @@
+// @category Stylize
+// @role effect
 // Print-style halftone dots: black on white, cyan/magenta/yellow screens, or
 // full CMYK with a black (key) screen at 45 degrees.
 Properties {

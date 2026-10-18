@@ -5,9 +5,10 @@ mod group;
 mod modules;
 mod save;
 mod settings;
+mod sync;
 mod ui;
 
-use modules::effects::shader_file::scan_library;
+use modules::effects::shader_file::{scan_library, ShaderInfo, ShaderRole};
 use modules::math::lag::LagMode;
 use modules::math::lfo::Wave;
 use modules::mix::blend::BlendMode;
@@ -44,8 +45,13 @@ const SIDEBAR_WIDTH: f32 = 220.0;
 const SIDEBAR_HEADER_H: f32 = 64.0;
 const MODULE_W: f32 = 220.0;
 const MODULE_RADIUS: f32 = 10.0;
+/// An `update` slower than this is logged (Settings → Debug).
+const SLOW_UPDATE: Duration = Duration::from_millis(50);
 const MINIMIZED_H: f32 = 34.0;
 const PREVIEW_H: f32 = 90.0;
+/// A minimized module with its preview on: the title band plus a small thumbnail.
+const MINI_PREVIEW_H: f32 = 45.0;
+const MINIMIZED_PREVIEW_H: f32 = MINIMIZED_H + MINI_PREVIEW_H + 8.0;
 const DROPDOWN_ROW_H: f32 = 26.0;
 const PROP_BOX_H: f32 = 20.0;
 /// Longer dropdowns scroll (mouse wheel) instead of running off screen.
@@ -130,7 +136,8 @@ struct TextEdit {
 
 #[derive(Clone, Copy)]
 enum Drag {
-    Module { id: u64, offset: Vec2 },
+    /// `start` is where the module sat when grabbed (to tell a click from a drag).
+    Module { id: u64, offset: Vec2, start: Point2 },
     Cable { from: u64 },
     /// Drag-to-adjust on a number box. `last_x` is the previous world x;
     /// `moved` the total screen distance, to tell a click from a drag.
@@ -152,7 +159,9 @@ enum Drag {
 enum SidebarRow {
     Header {
         rect: Rect,
-        label: &'static str,
+        label: String,
+        /// A heading inside a section (a shader category): smaller and dimmer.
+        sub: bool,
     },
     Module {
         row_rect: Rect,
@@ -170,9 +179,8 @@ enum SidebarRow {
 #[derive(Clone)]
 enum SidebarAction {
     Spawn(ModuleKind),
-    /// Spawns a Shader with this file already loaded: one the user pinned
-    /// (`pinned`), or a built-in shortcut (the mixer, generators).
-    Shader { file: String, pinned: bool },
+    /// Spawns the shader node for this file, with the file already loaded.
+    Shader { file: String },
     /// A saved group from the personal palette, by index into `presets`.
     Preset(usize),
 }
@@ -188,7 +196,7 @@ pub struct Model {
     pub yuyv_pipeline: gpu::YuyvPipeline,
     pub yuv420_pipeline: gpu::Yuv420Pipeline,
     /// File names found in the shaders folder (rescanned whenever a Shader's dropdown opens).
-    pub shader_library: Vec<String>,
+    pub shader_library: Vec<ShaderInfo>,
     pub next_id: u64,
     pub modules: Vec<PlacedModule>,
     pub connections: Vec<Connection>,
@@ -460,14 +468,23 @@ fn update(app: &App, model: &mut Model, update: Update) {
         }
     }
 
-    // A capture thread that died (device yanked mid-stream) leaves its
-    // module detached; the watcher re-attaches it if the camera returns.
+    // A capture thread that died (device yanked mid-stream) or stopped
+    // delivering frames (a hung driver call) is dropped; the module keeps its
+    // device and retries after a growing cooldown.
     for module in &mut model.modules {
         if let ModuleBody::Camera(cam) = &mut module.body {
-            if cam.worker.as_ref().is_some_and(|w| !w.is_alive()) {
-                dlog!("camera module {}: capture thread ended, detaching", module.id);
-                cam.worker = None;
-                cam.selected = None;
+            if let Some(w) = &cam.worker {
+                if w.has_frames() {
+                    cam.failures = 0;
+                }
+                let dead = !w.is_alive();
+                if dead || w.stalled() {
+                    dlog!("camera module {}: capture {}, restarting", module.id, if dead { "ended" } else { "stalled" });
+                    cam.worker = None;
+                    cam.chrome.preview_texture = None;
+                    cam.failures = (cam.failures + 1).min(5);
+                    cam.retry_at = Some(Instant::now() + Duration::from_secs(1 << (cam.failures - 1)));
+                }
             }
         }
     }
@@ -488,7 +505,7 @@ fn update(app: &App, model: &mut Model, update: Update) {
     for module in &mut model.modules {
         if let ModuleBody::Camera(cam) = &mut module.body {
             let needed = cam.chrome.show_preview || needed_ids.contains(&module.id);
-            if needed && cam.worker.is_none() {
+            if needed && cam.worker.is_none() && cam.retry_at.map_or(true, |t| Instant::now() >= t) {
                 if let Some(info) = cam.selected.and_then(|i| model.available_cameras.get(i)) {
                     cam.worker = Some(CameraWorker::spawn(info.index().clone()));
                 }
@@ -499,7 +516,14 @@ fn update(app: &App, model: &mut Model, update: Update) {
         // Videos too: an unused one frees its decoder and frame cache.
         if let ModuleBody::Video(video) = &mut module.body {
             let needed = video.chrome.show_preview || needed_ids.contains(&module.id);
-            if needed && video.worker.is_none() {
+            // A decoder that crashed (without an error to show) is replaced
+            // after a short pause.
+            if video.worker.as_ref().is_some_and(|w| !w.is_alive() && w.error().is_none()) {
+                dlog!("video module {}: decoder ended, restarting", module.id);
+                video.worker = None;
+                video.retry_at = Some(Instant::now() + Duration::from_secs(2));
+            }
+            if needed && video.worker.is_none() && video.retry_at.map_or(true, |t| Instant::now() >= t) {
                 if let Some(path) = video.path.clone() {
                     video.worker = Some(VideoWorker::spawn(path));
                 }
@@ -519,6 +543,9 @@ fn update(app: &App, model: &mut Model, update: Update) {
     timings.update += started.elapsed();
     timings.view += model.view_time.take();
     timings.report_every_second();
+    if started.elapsed() > SLOW_UPDATE {
+        dlog!("slow update: {:.0}ms", started.elapsed().as_secs_f32() * 1000.0);
+    }
 }
 
 fn start_wled(settings: &Settings) -> WledManager {
@@ -785,7 +812,7 @@ fn mouse_moved(app: &App, model: &mut Model, screen_pos: Point2) {
             model.pan += (screen_pos - last) * model.settings.drag_speed;
             model.dragging = Some(Drag::Pan { last: screen_pos });
         }
-        Some(Drag::Module { id, offset }) => {
+        Some(Drag::Module { id, offset, .. }) => {
             // The grabbed module leads; the rest of the selection follows.
             let Some(lead) = model.modules.iter().find(|m| m.id == id) else { return };
             let delta = pos + offset - lead.pos;
@@ -1366,8 +1393,7 @@ fn open_dropdown(model: &Model) -> Option<usize> {
 fn handle_right_press(model: &mut Model, win: Rect, screen: Point2) {
     commit_edit(model);
     close_popups(model);
-    // Right-clicking a pinned shader in the sidebar unpins it.
-    // Right-clicking a pinned shader or a saved group in the sidebar removes it.
+    // Right-clicking a saved group in the sidebar removes it.
     if sidebar_rect(win).contains(screen) {
         let hit = sidebar_items(model, win).into_iter().find_map(|row| match row {
             SidebarRow::Module { row_rect, action, .. } if row_rect.contains(screen) && sidebar_list_rect(win).contains(screen) => {
@@ -1376,7 +1402,6 @@ fn handle_right_press(model: &mut Model, win: Rect, screen: Point2) {
             _ => None,
         });
         match hit {
-            Some(SidebarAction::Shader { file, pinned: true }) => toggle_favorite(model, &file),
             Some(SidebarAction::Preset(i)) if i < model.presets.len() => {
                 let preset = model.presets.remove(i);
                 save::save_presets(&model.presets);
@@ -1648,20 +1673,17 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             }
         }
 
-        // The star at the end of a shader row pins it; the list stays open.
-        if let (ModuleBody::Shader(_), Some(Some(i))) = (&model.modules[open_idx].body, choice) {
-            let rect = dropdown_option_rect(selector, i + 1 - first);
-            if mouse.x > rect.right() - ui::STAR_W {
-                if let Some(file) = model.shader_library.get(i).cloned() {
-                    toggle_favorite(model, &file);
-                }
-                return;
-            }
+        // Shader rows: category headings do nothing and keep the list open.
+        let shader_rows = match (&model.modules[open_idx].body, model.modules[open_idx].kind.shader_role()) {
+            (ModuleBody::Shader(_), Some(role)) => shader_rows(model, role),
+            _ => Vec::new(),
+        };
+        if let Some(ShaderRow::Header(_)) = row.and_then(|r| shader_rows.get(r)) {
+            return;
         }
 
         model.dropdown_scroll = 0.0;
         let devices = wled_devices(model);
-        let library = model.shader_library.clone();
         let available = model.available_cameras.clone();
         match &mut model.modules[open_idx].body {
             ModuleBody::Camera(cam) => {
@@ -1672,8 +1694,10 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             }
             ModuleBody::Shader(shader) => {
                 shader.dropdown_open = false;
-                if let Some(pick) = choice {
-                    shader.select(pick.and_then(|i| library.get(i).cloned()));
+                match row.and_then(|r| shader_rows.get(r)) {
+                    Some(ShaderRow::None) => shader.select(None),
+                    Some(ShaderRow::File(file)) => shader.select(Some(file.clone())),
+                    _ => {}
                 }
             }
             ModuleBody::Lfo(lfo) => {
@@ -1799,8 +1823,9 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             Some(SidebarAction::Spawn(kind)) => {
                 model.selected = vec![spawn_module(win, model, kind)];
             }
-            Some(SidebarAction::Shader { file, .. }) => {
-                let id = spawn_module(win, model, ModuleKind::Shader);
+            Some(SidebarAction::Shader { file }) => {
+                let role = model.shader_library.iter().find(|i| i.file == file).map_or(ShaderRole::Effect, |i| i.role);
+                let id = spawn_module(win, model, ModuleKind::for_shader_role(role));
                 if let Some(ModuleBody::Shader(shader)) = model.modules.iter_mut().find(|m| m.id == id).map(|m| &mut m.body) {
                     shader.select(Some(file));
                 }
@@ -1983,8 +2008,9 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             // Bring the grabbed module to the front.
             let module = model.modules.remove(i);
             let offset = module.pos - mouse;
+            let start = module.pos;
             model.modules.push(module);
-            model.dragging = Some(Drag::Module { id, offset });
+            model.dragging = Some(Drag::Module { id, offset, start });
             return;
         }
     }
@@ -2099,6 +2125,18 @@ fn handle_release(app: &App, model: &mut Model) {
         }
         Some(Drag::Group { .. } | Drag::Scrub { .. }) => {
             model.dragging = None;
+            return;
+        }
+        Some(Drag::Module { id, start, .. }) => {
+            model.dragging = None;
+            if let Some((index, input)) = insert_candidate(model, id, start) {
+                insert_into_cable(model, id, index, input);
+            }
+            let mut moved = model.selected.clone();
+            if !moved.contains(&id) {
+                moved.push(id);
+            }
+            push_overlapping(model, &moved);
             return;
         }
         _ => {}
@@ -2239,17 +2277,6 @@ fn spawn_module(win: Rect, model: &mut Model, kind: ModuleKind) -> u64 {
     push_module(model, kind, pos)
 }
 
-fn toggle_favorite(model: &mut Model, file: &str) {
-    let favorites = &mut model.settings.favorite_shaders;
-    match favorites.iter().position(|f| f == file) {
-        Some(i) => {
-            favorites.remove(i);
-        }
-        None => favorites.push(file.to_string()),
-    }
-    model.settings.save();
-}
-
 /// "wave_distort.glsl" -> "Wave Distort".
 fn shader_display_name(file: &str) -> String {
     let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
@@ -2346,16 +2373,8 @@ fn center_on_modules(model: &mut Model, win: Rect) {
     }
 }
 
-/// Shader files that also get their own sidebar entry: (category, label, file).
-const BUILTIN_SHADERS: &[(&str, &str, &str)] = &[
-    ("Sources", "Noise", "noise.glsl"),
-    ("Sources", "Voronoi", "voronoi.glsl"),
-    ("Mix", "Mixer (4 in)", "mixer.glsl"),
-    ("Effects", "Feedback", "feedback.glsl"),
-];
-
 fn sidebar_items(model: &Model, win: Rect) -> Vec<SidebarRow> {
-    sidebar_rows(win, &model.settings.favorite_shaders, &model.presets, model.sidebar_scroll)
+    sidebar_rows(win, &model.shader_library, &model.presets, model.sidebar_scroll)
 }
 
 /// The scrollable middle of the sidebar, between Save/Load and Settings.
@@ -2371,7 +2390,7 @@ fn sidebar_list_rect(win: Rect) -> Rect {
     )
 }
 
-fn sidebar_rows(win: Rect, favorites: &[String], presets: &[Preset], scroll: f32) -> Vec<SidebarRow> {
+fn sidebar_rows(win: Rect, library: &[ShaderInfo], presets: &[Preset], scroll: f32) -> Vec<SidebarRow> {
     let sidebar = sidebar_rect(win);
     let mut rows = Vec::new();
     let mut y = sidebar.top() - SIDEBAR_HEADER_H - 24.0 + scroll;
@@ -2379,34 +2398,39 @@ fn sidebar_rows(win: Rect, favorites: &[String], presets: &[Preset], scroll: f32
     let plus = |r: Rect| Rect::from_w_h(24.0, 24.0).mid_right_of(r).shift_x(-4.0);
 
     for (category, mods) in CATEGORIES {
-        rows.push(SidebarRow::Header { rect: row(y, 26.0), label: category });
+        rows.push(SidebarRow::Header { rect: row(y, 26.0), label: category.to_string(), sub: false });
         y -= 34.0;
 
-        // Pinned shaders sit right under the plain Shader entry.
-        let pinned = favorites
-            .iter()
-            .filter(|_| mods.iter().any(|(_, k)| *k == ModuleKind::Shader))
-            .map(|f| (shader_display_name(f), SidebarAction::Shader { file: f.clone(), pinned: true }));
-        let builtin = BUILTIN_SHADERS
-            .iter()
-            .filter(|(c, _, _)| c == category)
-            .map(|(_, label, file)| (label.to_string(), SidebarAction::Shader { file: file.to_string(), pinned: false }));
-        let entries = mods
-            .iter()
-            .map(|(label, kind)| (label.to_string(), SidebarAction::Spawn(*kind)))
-            .chain(builtin)
-            .chain(pinned);
-        for (label, action) in entries {
-            let h = if matches!(action, SidebarAction::Shader { pinned: true, .. }) { 28.0 } else { 32.0 };
-            let row_rect = row(y, h);
-            rows.push(SidebarRow::Module { row_rect, plus_rect: plus(row_rect), label, action });
-            y -= h + 4.0;
+        for (label, kind) in mods.iter() {
+            let row_rect = row(y, 32.0);
+            rows.push(SidebarRow::Module { row_rect, plus_rect: plus(row_rect), label: label.to_string(), action: SidebarAction::Spawn(*kind) });
+            y -= 36.0;
+        }
+
+        // Every shader is an effect of its own, listed under its category.
+        if *category == "Effects" {
+            let mut current: Option<&str> = None;
+            for info in library {
+                if current != Some(info.category.as_str()) {
+                    current = Some(&info.category);
+                    rows.push(SidebarRow::Header { rect: row(y, 22.0), label: info.category.clone(), sub: true });
+                    y -= 26.0;
+                }
+                let row_rect = row(y, 28.0);
+                rows.push(SidebarRow::Module {
+                    row_rect,
+                    plus_rect: plus(row_rect),
+                    label: shader_display_name(&info.file),
+                    action: SidebarAction::Shader { file: info.file.clone() },
+                });
+                y -= 32.0;
+            }
         }
 
         y -= 12.0;
     }
 
-    rows.push(SidebarRow::Header { rect: row(y, 26.0), label: "My groups" });
+    rows.push(SidebarRow::Header { rect: row(y, 26.0), label: "My groups".to_string(), sub: false });
     y -= 34.0;
     if presets.is_empty() {
         rows.push(SidebarRow::Hint { rect: row(y - 8.0, 44.0), text: "Select modules, Cmd/Ctrl+G,\nthen the star on the group" });
@@ -2422,7 +2446,7 @@ fn sidebar_rows(win: Rect, favorites: &[String], presets: &[Preset], scroll: f32
 
 /// Scrolls the sidebar list by `dy` pixels, within its content.
 fn scroll_sidebar(model: &mut Model, win: Rect, dy: f32) {
-    let rows = sidebar_rows(win, &model.settings.favorite_shaders, &model.presets, 0.0);
+    let rows = sidebar_rows(win, &model.shader_library, &model.presets, 0.0);
     let bottom = rows
         .iter()
         .map(|r| match r {
@@ -2438,7 +2462,11 @@ fn scroll_sidebar(model: &mut Model, win: Rect, dy: f32) {
 /// otherwise its normal content plus a preview strip if that's enabled.
 fn body_height(minimized: bool, show_preview: bool, base: f32) -> f32 {
     if minimized {
-        MINIMIZED_H
+        if show_preview {
+            MINIMIZED_PREVIEW_H
+        } else {
+            MINIMIZED_H
+        }
     } else if show_preview {
         base + PREVIEW_H + 8.0
     } else {
@@ -2766,20 +2794,31 @@ fn title_button_rect(body: Rect, slot: usize) -> Rect {
 }
 
 fn module_output_port(body: Rect) -> Point2 {
+    if is_minimized_body(body) {
+        return pt2(body.right(), body.top() - MINIMIZED_H / 2.0);
+    }
     pt2(body.right(), body.y())
+}
+
+/// Whether a body rect is a minimized module's (with or without preview).
+fn is_minimized_body(body: Rect) -> bool {
+    body.h() <= MINIMIZED_H + 0.5 || (body.h() - MINIMIZED_PREVIEW_H).abs() < 0.5
 }
 
 /// Input ports are spaced evenly down the left edge; a single input sits
 /// dead center, matching every module that used to have exactly one.
 fn module_input_port(kind: ModuleKind, body: Rect, index: usize, total: usize) -> Point2 {
     // Shader ports hang below the file selector, one labelled row each.
-    if kind == ModuleKind::Shader {
-        if body.h() <= MINIMIZED_H {
-            return pt2(body.left(), body.y());
+    if kind.is_shader() {
+        if is_minimized_body(body) {
+            return pt2(body.left(), body.top() - MINIMIZED_H / 2.0);
         }
         return pt2(body.left(), body.top() - SHADER_PORT_TOP - index as f32 * SHADER_PORT_STEP);
     }
     if total <= 1 {
+        if is_minimized_body(body) {
+            return pt2(body.left(), body.top() - MINIMIZED_H / 2.0);
+        }
         return pt2(body.left(), body.y());
     }
     let step = body.h() / (total as f32 + 1.0);
@@ -2850,14 +2889,7 @@ fn view(app: &App, model: &Model, render_frame: nannou::Frame) {
                 let rows: Vec<Rect> = (0..labels.len()).map(|r| dropdown_option_rect(selector, r)).collect();
                 let world_mouse = to_world(model, mouse);
                 let hovered = rows.iter().position(|r| r.contains(world_mouse));
-                let stars: Vec<Option<bool>> = match &module.body {
-                    ModuleBody::Shader(s) if s.prop_dropdown.is_none() => std::iter::once(None)
-                        .chain(model.shader_library.iter().map(|f| Some(model.settings.favorite_shaders.contains(f))))
-                        .skip(first)
-                        .take(labels.len())
-                        .collect(),
-                    _ => Vec::new(),
-                };
+                let stars: Vec<Option<bool>> = Vec::new();
                 let selected = dropdown_selected(model, module).checked_sub(first).filter(|r| *r < labels.len());
                 ui::dropdown(&world, t, &rows, labels, selected, hovered, &stars);
                 if all_labels.len() > labels.len() {
@@ -2949,8 +2981,11 @@ fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<
     // scrolls under them.
     for row in sidebar_items(model, win) {
         match row {
-            SidebarRow::Header { rect, label } => {
+            SidebarRow::Header { rect, label, sub: false } => {
                 ui::label_left(draw, rect.pad_left(-6.0), &label.to_uppercase(), t.text_dim, 11);
+            }
+            SidebarRow::Header { rect, label, sub: true } => {
+                ui::label_left(draw, rect.pad_left(4.0), &label, t.accent, 11);
             }
             SidebarRow::Hint { rect, text } => {
                 draw.text(text)
@@ -2966,13 +3001,8 @@ fn draw_sidebar(draw: &Draw, t: &Theme, win: Rect, model: &Model, hover: Option<
                     ui::rounded(draw, row_rect, ui::RADIUS, t.button_hover);
                 }
                 match action {
-                    SidebarAction::Spawn(_) | SidebarAction::Shader { pinned: false, .. } => {
-                        ui::label_left(draw, row_rect, &label, t.text, 14)
-                    }
-                    SidebarAction::Shader { pinned: true, .. } => {
-                        ui::star(draw, pt2(row_rect.left() + 18.0, row_rect.y()), 6.0, t.video_port, true);
-                        ui::label_left(draw, row_rect.pad_left(18.0).pad_right(28.0), &label, t.text, 13);
-                    }
+                    SidebarAction::Spawn(_) => ui::label_left(draw, row_rect, &label, t.text, 14),
+                    SidebarAction::Shader { .. } => ui::label_left(draw, row_rect.pad_left(10.0).pad_right(28.0), &label, t.text, 13),
                     SidebarAction::Preset(_) => {
                         let icon = Rect::from_x_y_w_h(row_rect.left() + 18.0, row_rect.y(), 14.0, 11.0);
                         ui::rounded_outline(draw, icon, 3.0, t.accent, 1.5);
@@ -3057,10 +3087,12 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
     let body = module_body_rect(module);
     let hovered = |r: Rect| hover.is_some_and(|m| r.contains(m));
 
+    // Dragged over a cable it would be spliced into: the box takes the accent color.
+    let will_connect = matches!(model.dragging, Some(Drag::Module { id, start, .. }) if id == module.id && insert_candidate(model, id, start).is_some());
     ui::shadow(draw, t, body, MODULE_RADIUS);
-    ui::rounded(draw, body, MODULE_RADIUS, t.module(module.kind));
+    ui::rounded(draw, body, MODULE_RADIUS, if will_connect { t.accent } else { t.module(module.kind) });
     // A slightly darker title band.
-    let band_h = if chrome.minimized { body.h() } else { 34.0 };
+    let band_h = if chrome.minimized { MINIMIZED_H } else { 34.0 };
     let band = Rect::from_x_y_w_h(body.x(), body.top() - band_h / 2.0, body.w(), band_h);
     ui::rounded(draw, band, MODULE_RADIUS, rgba8(0, 0, 0, 45));
     let selected = model.selected.contains(&module.id);
@@ -3072,7 +3104,11 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
 
     let buttons = title_buttons_for(module.kind);
     let title_rect = Rect::from_x_y_w_h(body.x(), band.y(), body.w(), 24.0).pad_right(buttons.len() as f32 * 24.0 + 8.0);
-    ui::label_left(draw, title_rect, kind_label(module.kind), t.title_text, 15);
+    let title = match &module.body {
+        ModuleBody::Shader(s) => s.file.as_deref().map_or_else(|| kind_label(module.kind).to_string(), shader_display_name),
+        _ => kind_label(module.kind).to_string(),
+    };
+    ui::label_left(draw, title_rect, &title, t.title_text, 15);
     draw_title_buttons(draw, t, body, buttons, chrome, hover);
 
     if !chrome.minimized {
@@ -3156,6 +3192,9 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
             let preview = preview_rect(body, module.base_height(), has_config_row(module.kind));
             draw_preview(draw, t, preview, chrome.preview_texture.as_ref());
         }
+    } else if chrome.show_preview {
+        let preview = Rect::from_x_y_w_h(body.x(), body.top() - MINIMIZED_H - 4.0 - MINI_PREVIEW_H / 2.0, body.w() - 24.0, MINI_PREVIEW_H);
+        draw_preview(draw, t, preview, chrome.preview_texture.as_ref());
     }
 
     if let Some(port_type) = output_type(module.kind) {
@@ -3373,6 +3412,29 @@ fn draw_param_menu(draw: &Draw, t: &Theme, win: Rect, model: &Model, mouse: Poin
     ui::button(draw, t, layout.reset, "Reset", layout.reset.contains(mouse));
 }
 
+/// One row of a shader node's file dropdown.
+#[derive(Clone)]
+enum ShaderRow {
+    None,
+    Header(String),
+    File(String),
+}
+
+/// "None", then each category heading followed by the files whose role the
+/// node lists (the library is sorted by category).
+fn shader_rows(model: &Model, role: ShaderRole) -> Vec<ShaderRow> {
+    let mut rows = vec![ShaderRow::None];
+    let mut category: Option<&str> = None;
+    for info in model.shader_library.iter().filter(|i| role.lists(i.role)) {
+        if category != Some(info.category.as_str()) {
+            category = Some(&info.category);
+            rows.push(ShaderRow::Header(info.category.clone()));
+        }
+        rows.push(ShaderRow::File(info.file.clone()));
+    }
+    rows
+}
+
 /// Row labels for a module's open dropdown: "None" first, then each choice.
 fn dropdown_labels(model: &Model, module: &PlacedModule) -> Vec<String> {
     match module.body {
@@ -3390,9 +3452,18 @@ fn dropdown_labels(model: &Model, module: &PlacedModule) -> Vec<String> {
     let choices: Vec<String> = match &module.body {
         ModuleBody::Camera(_) => model.available_cameras.iter().map(|c| c.human_name().to_string()).collect(),
         ModuleBody::Wled(_) => wled_devices(model).into_iter().map(|(_, name)| name).collect(),
-        ModuleBody::Shader(_) => model.shader_library.clone(),
         _ => Vec::new(),
     };
+    if let (ModuleBody::Shader(_), Some(role)) = (&module.body, module.kind.shader_role()) {
+        return shader_rows(model, role)
+            .into_iter()
+            .map(|r| match r {
+                ShaderRow::None => "None".to_string(),
+                ShaderRow::Header(c) => format!("{}{c}", ui::HEADING),
+                ShaderRow::File(f) => shader_display_name(&f),
+            })
+            .collect();
+    }
     std::iter::once("None".to_string()).chain(choices).collect()
 }
 
@@ -3412,8 +3483,8 @@ fn dropdown_selected(model: &Model, module: &PlacedModule) -> usize {
         ModuleBody::Shader(s) => s
             .file
             .as_ref()
-            .and_then(|f| model.shader_library.iter().position(|l| l == f))
-            .map_or(0, |i| i + 1),
+            .and_then(|f| shader_rows(model, module.kind.shader_role()?).iter().position(|r| matches!(r, ShaderRow::File(l) if l == f)))
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -3433,33 +3504,131 @@ fn draw_preview(draw: &Draw, t: &Theme, rect: Rect, texture: Option<&gpu::DrawTe
     ui::rounded_outline(draw, rect, ui::RADIUS, t.border, 1.0);
 }
 
+/// The world-space ends of a connection's cable, or `None` when it isn't
+/// drawn. Cables to modules inside a collapsed group attach to the group's
+/// box; ones between two hidden members aren't drawn.
+fn cable_ends(model: &Model, c: &Connection) -> Option<(Point2, Point2)> {
+    let from = model.modules.iter().find(|m| m.id == c.from)?;
+    let to = model.modules.iter().find(|m| m.id == c.to)?;
+    let to_inputs = to.input_types().len();
+    if c.to_input >= to_inputs {
+        return None;
+    }
+    let collapsed_frame = |id: u64| {
+        model.group_of(id).filter(|g| g.collapsed).and_then(|g| model.group_frame(g).map(|f| (g.id, f)))
+    };
+    let (from_group, to_group) = (collapsed_frame(from.id), collapsed_frame(to.id));
+    if let (Some((a, _)), Some((b, _))) = (from_group, to_group) {
+        if a == b {
+            return None;
+        }
+    }
+    let start = from_group.map_or_else(|| module_output_port(module_body_rect(from)), |(_, f)| group::collapsed_port(f, true));
+    let end = to_group.map_or_else(
+        || module_input_port(to.kind, module_body_rect(to), c.to_input, to_inputs),
+        |(_, f)| group::collapsed_port(f, false),
+    );
+    Some((start, end))
+}
+
 fn draw_cables(draw: &Draw, t: &Theme, model: &Model) {
-    for c in &model.connections {
-        let from = model.modules.iter().find(|m| m.id == c.from);
-        let to = model.modules.iter().find(|m| m.id == c.to);
-        if let (Some(from), Some(to)) = (from, to) {
-            let to_inputs = to.input_types().len();
-            if c.to_input >= to_inputs {
-                continue;
-            }
-            let color = output_type(from.kind).map_or(t.text_dim, |p| t.port(p));
-            // Cables to modules inside a collapsed group attach to the
-            // group's box; ones between two hidden members aren't drawn.
-            let collapsed_frame = |id: u64| {
-                model.group_of(id).filter(|g| g.collapsed).and_then(|g| model.group_frame(g).map(|f| (g.id, f)))
-            };
-            let (from_group, to_group) = (collapsed_frame(from.id), collapsed_frame(to.id));
-            if let (Some((a, _)), Some((b, _))) = (from_group, to_group) {
-                if a == b {
-                    continue;
-                }
-            }
-            let start = from_group.map_or_else(|| module_output_port(module_body_rect(from)), |(_, f)| group::collapsed_port(f, true));
-            let end = to_group.map_or_else(
-                || module_input_port(to.kind, module_body_rect(to), c.to_input, to_inputs),
-                |(_, f)| group::collapsed_port(f, false),
-            );
-            draw_cable(draw, t, start, end, color);
+    // While a module is dragged over a cable it could be inserted into, that
+    // cable lights up.
+    let candidate = match model.dragging {
+        Some(Drag::Module { id, start, .. }) => insert_candidate(model, id, start).map(|(index, _)| index),
+        _ => None,
+    };
+    for (index, c) in model.connections.iter().enumerate() {
+        let Some((start, end)) = cable_ends(model, c) else { continue };
+        let Some(from) = model.modules.iter().find(|m| m.id == c.from) else { continue };
+        let color = if candidate == Some(index) { t.accent } else { output_type(from.kind).map_or(t.text_dim, |p| t.port(p)) };
+        draw_cable(draw, t, start, end, color);
+    }
+}
+
+/// How far (world units) a dragged module must travel before releasing it
+/// over a cable inserts it, so a plain click never rewires anything.
+const INSERT_MIN_DRAG: f32 = 6.0;
+
+/// The cable a dragged module would be inserted into, and which of its
+/// inputs takes the signal: the module must be the only one moving, sit on
+/// the cable, and have an unplugged input and an output of the cable's type.
+fn insert_candidate(model: &Model, id: u64, start: Point2) -> Option<(usize, usize)> {
+    if model.selected.iter().any(|s| *s != id) || model.hidden(id) {
+        return None;
+    }
+    let module = model.modules.iter().find(|m| m.id == id)?;
+    if module.pos.distance(start) < INSERT_MIN_DRAG {
+        return None;
+    }
+    let body = module_body_rect(module);
+    let inputs = module.input_types();
+    // (connection, input of the module, distance from the module's center)
+    let mut best: Option<(usize, usize, f32)> = None;
+    for (index, c) in model.connections.iter().enumerate() {
+        if c.from == id || c.to == id {
+            continue;
+        }
+        let Some((cable_start, cable_end)) = cable_ends(model, c) else { continue };
+        let Some(signal) = model.modules.iter().find(|m| m.id == c.from).and_then(|m| output_type(m.kind)) else { continue };
+        if output_type(module.kind) != Some(signal) {
+            continue;
+        }
+        let Some(input) = (0..inputs.len()).find(|&n| inputs[n] == signal && input_source(&model.connections, id, n).is_none())
+        else {
+            continue;
+        };
+        // Wiring `from -> module` must not close a loop through the module.
+        if reaches(&model.connections, id, c.from, &mut Vec::new()) {
+            continue;
+        }
+        let nearest = cable_points(cable_start, cable_end)
+            .into_iter()
+            .filter(|p| body.contains(*p))
+            .map(|p| p.distance(body.xy()))
+            .fold(f32::MAX, f32::min);
+        if nearest < f32::MAX && best.map_or(true, |(_, _, d)| nearest < d) {
+            best = Some((index, input, nearest));
+        }
+    }
+    best.map(|(index, input, _)| (index, input))
+}
+
+/// Splits connection `index` (`a -> b`) into `a -> module` (at `input`) and
+/// `module -> b`.
+fn insert_into_cable(model: &mut Model, id: u64, index: usize, input: usize) {
+    let Connection { from, to, to_input } = model.connections.remove(index);
+    model.connections.push(Connection { from, to: id, to_input: input });
+    model.connections.push(Connection { from: id, to, to_input });
+}
+
+/// After dropping modules, shoves any module they overlap sideways (away
+/// from the dropped one), chaining on to whatever those then overlap.
+fn push_overlapping(model: &mut Model, moved: &[u64]) {
+    const GAP: f32 = 16.0;
+    let mut settled: Vec<u64> = moved.to_vec();
+    let mut queue: Vec<u64> = moved.to_vec();
+    let mut steps = 0;
+    while let Some(anchor) = queue.pop() {
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+        let Some(a) = model.modules.iter().find(|m| m.id == anchor).map(module_body_rect) else { continue };
+        let keep_clear = Rect::from_xy_wh(a.xy(), a.wh() + vec2(2.0 * GAP, 2.0 * GAP));
+        let hit: Vec<u64> = model
+            .modules
+            .iter()
+            .filter(|m| !settled.contains(&m.id) && !model.hidden(m.id) && module_body_rect(m).overlap(keep_clear).is_some())
+            .map(|m| m.id)
+            .collect();
+        for id in hit {
+            let Some(m) = model.modules.iter_mut().find(|m| m.id == id) else { continue };
+            let r = module_body_rect(m);
+            let dx = if r.x() >= a.x() { a.right() + GAP - r.left() } else { a.left() - GAP - r.right() };
+            m.pos.x += dx;
+            settled.push(id);
+            queue.push(id);
         }
     }
 }
@@ -3535,17 +3704,22 @@ fn draw_dragged_cable(draw: &Draw, t: &Theme, app: &App, model: &Model) {
     }
 }
 
-/// A cable as a horizontal S-curve, so it leaves and enters ports sideways.
-fn draw_cable(draw: &Draw, t: &Theme, start: Point2, end: Point2, color: ui::Color) {
+/// The sampled curve of a cable from `start` to `end`.
+fn cable_points(start: Point2, end: Point2) -> Vec<Point2> {
     let pull = ((end.x - start.x).abs() * 0.5).max(40.0);
     let (c1, c2) = (start + vec2(pull, 0.0), end - vec2(pull, 0.0));
-    let points: Vec<Point2> = (0..=24)
+    (0..=24)
         .map(|i| {
             let s = i as f32 / 24.0;
             let u = 1.0 - s;
             start * (u * u * u) + c1 * (3.0 * u * u * s) + c2 * (3.0 * u * s * s) + end * (s * s * s)
         })
-        .collect();
+        .collect()
+}
+
+/// A cable as a horizontal S-curve, so it leaves and enters ports sideways.
+fn draw_cable(draw: &Draw, t: &Theme, start: Point2, end: Point2, color: ui::Color) {
+    let points = cable_points(start, end);
     draw.polyline().weight(6.0).color(t.shadow).points(points.clone());
     draw.polyline().weight(3.5).color(color).points(points);
 }

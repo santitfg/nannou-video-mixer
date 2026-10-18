@@ -465,7 +465,7 @@ fn restore_body(saved: SavedModule, cameras: &[CameraInfo]) -> ModuleBody {
             lfo.centered = saved.centered.unwrap_or(false);
             ModuleBody::Lfo(lfo)
         }
-        ModuleKind::Shader => {
+        ModuleKind::Shader | ModuleKind::Generator | ModuleKind::Effect | ModuleKind::Feedback | ModuleKind::ShaderMix => {
             // Ports and defaults come from the file, so they're built
             // on the next tick, when the shader gets compiled.
             let mut shader = ShaderState::new();

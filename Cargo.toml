@@ -19,11 +19,11 @@ wled_pots = { path = "wled_pots" }
 # at build time; see README). Only demuxing + decoding + scaling are used.
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling", "build"] }
 
+# Resolves wgpu's error-scope future (ready immediately on native).
+pollster = "0.4"
+
 [profile.release]
 opt-level = 3
-
-[dev-dependencies]
-pollster = "0.4"
 
 # Camera MJPEG decoding, image resizing etc. are far too slow unoptimized;
 # keep our own code debuggable but build dependencies with optimizations.

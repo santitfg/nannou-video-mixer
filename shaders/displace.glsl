@@ -1,3 +1,5 @@
+// @category Distortion
+// @role effect
 // Displaces iChannel0 using a map: iChannel1 if plugged (its brightness, or
 // its red/green as an x/y vector), otherwise built-in animated noise.
 Properties {

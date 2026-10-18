@@ -1,3 +1,5 @@
+// @category Generators
+// @role generator
 // Generator: no inputs, just math. Plug Number/LFO modules into the
 // ports named after the properties below.
 Properties {

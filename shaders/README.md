@@ -1,9 +1,24 @@
 # Shaders
 
-Every `.glsl` / `.frag` file in this folder shows up in the **Shader**
-module's dropdown (Effects → Shader). The file is watched: save it and the
+Every `.glsl` / `.frag` file in this folder shows up in the sidebar's
+**Effects** list (by category) and in the dropdown of nodes of its role:
+generator, effect, feedback or mix. The file is watched: save it and the
 module recompiles live; on a compile error the last good version keeps
 running and the error is shown inside the module.
+
+## Category and role
+
+The first lines of a file can declare where it is listed:
+
+```glsl
+// @category Distortion
+// @role effect
+```
+
+* `@category`: the group heading in the dropdown (free text; default `Other`).
+* `@role`: which node lists it: `generator` (no input), `effect` (one video
+  input), `feedback` (reads `iFeedback`) or `mix` (several inputs). When
+  omitted it is inferred from the code.
 
 ## Format
 
@@ -49,12 +64,11 @@ _Mode ("Mode", Enum(Classic, Additive, Water)) = 0
 if (_Mode == 1) { ... }
 ```
 
-## Favorites
+## Sidebar
 
-In a Shader module's file dropdown, click the star at the end of a row to
-pin that shader. Pinned shaders appear in the sidebar under **Effects** and
-create a Shader with that file already loaded. Right-click one in the
-sidebar (or click its star again) to unpin it.
+Every shader is listed in the sidebar under **Effects**, grouped by its
+`@category`. Adding one creates a node of the matching role with that file
+loaded; the node's own dropdown lists the other shaders of the same role.
 
 ## Limitations
 

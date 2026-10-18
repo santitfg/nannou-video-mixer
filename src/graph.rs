@@ -8,13 +8,16 @@
 use crate::modules::effects::shader::compile_pending;
 use crate::modules::sources::camera::CameraState;
 use crate::modules::sources::video::VideoState;
-use crate::modules::{input_source, module_number, Connection, ModuleBody, PlacedModule};
+use crate::modules::{input_source, module_number, reaches, Connection, ModuleBody, PlacedModule};
 use crate::gpu::VideoTex;
 use crate::Model;
 use nannou::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use wgpu_upstream as wgpu;
+
+/// Tallest render, in pixels, of a shader that only feeds a preview thumbnail.
+const PREVIEW_RENDER_H: u32 = 270;
 
 /// Inputs before the module that reads them, each id once. Cycles are cut
 /// wherever they're first re-entered.
@@ -53,6 +56,13 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
             .map(|m| m.id),
     );
     let order = evaluation_order(&model.connections, &roots);
+    // Modules only a thumbnail looks at render small: a preview is ~90 px
+    // tall, so a full-size pass behind it is wasted GPU time.
+    let feeds_output: HashSet<u64> = order
+        .iter()
+        .copied()
+        .filter(|&id| reaches(&model.connections, id, model.output_id, &mut Vec::new()))
+        .collect();
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("graph") });
     let mut results: HashMap<u64, VideoTex> = HashMap::new();
@@ -88,7 +98,8 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
                         .map(|i| shader.prop_value(i, number_in(&model.modules, channels_n + i)))
                         .collect();
                     let ModuleBody::Shader(shader) = &mut model.modules[idx].body else { unreachable!() };
-                    shader.record(device, queue, &mut encoder, &channels, values, now, delta)
+                    let cap = (!feeds_output.contains(&id)).then_some(PREVIEW_RENDER_H);
+                    shader.record(device, queue, &mut encoder, &channels, values, now, delta, cap)
                 }
             }
             ModuleBody::Number(_)

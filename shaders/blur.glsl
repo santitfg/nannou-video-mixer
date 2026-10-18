@@ -1,3 +1,5 @@
+// @category Blur & Glow
+// @role effect
 // Gaussian blur (9x9 taps, spread by Radius pixels).
 Properties {
     _Radius ("Radius", Range(0, 20)) = 4.0

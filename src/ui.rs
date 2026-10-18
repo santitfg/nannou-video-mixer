@@ -91,7 +91,9 @@ impl Theme {
         match kind {
             ModuleKind::Camera | ModuleKind::Video => self.camera,
             ModuleKind::Blend => self.blend,
-            ModuleKind::Shader => self.shader,
+            ModuleKind::Shader | ModuleKind::Generator | ModuleKind::Effect | ModuleKind::Feedback | ModuleKind::ShaderMix => {
+                self.shader
+            }
             ModuleKind::Output => self.output,
             ModuleKind::Number
             | ModuleKind::Mult
@@ -459,6 +461,11 @@ pub fn dropdown(
     boxed(draw, list, RADIUS, t.panel, t.border);
     for (i, (rect, text)) in rows.iter().zip(labels).enumerate() {
         let row = rect.pad_top(1.0).pad_bottom(1.0);
+        // A category heading: dim, flat, never highlighted.
+        if let Some(heading) = text.strip_prefix(HEADING) {
+            label_left(draw, row.pad_left(10.0), &heading.to_uppercase(), t.text_dim, 10);
+            continue;
+        }
         let (fill, color) = if hovered == Some(i) {
             (t.accent, t.accent_text)
         } else if selected == Some(i) {
@@ -485,6 +492,9 @@ pub fn dropdown(
         }
     }
 }
+
+/// Marks a dropdown label as a non-selectable category heading.
+pub const HEADING: char = '\u{1}';
 
 /// Width of the favorite-star hit area at the right of a dropdown row.
 pub const STAR_W: f32 = 28.0;

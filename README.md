@@ -36,6 +36,14 @@ needs nothing installed to run. Building it needs, on every platform:
 
 The first build takes a couple of minutes longer; later builds reuse it.
 
+Install these once with the setup script for your platform, then `cargo run`:
+
+| Platform | Script |
+|---|---|
+| Linux (Debian/Ubuntu) | `./scripts/setup-linux.sh` |
+| macOS | `./scripts/setup-macos.sh` |
+| Windows 11 | `powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1` (then open a new terminal) |
+
 Build scripts live in `scripts/` and produce binaries under `dist/<platform>/`. All are run from Linux.
 
 ### Linux (native)

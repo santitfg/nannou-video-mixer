@@ -5,7 +5,8 @@ use nokhwa::pixel_format::RgbAFormat;
 use nokhwa::utils::{ApiBackend, CameraIndex, CameraInfo, FrameFormat, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 use crate::dlog;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::{lock, try_lock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -69,7 +70,21 @@ pub struct CameraWorker {
     /// False once the capture thread has exited (device unplugged, failed
     /// to open, ...).
     alive: Arc<AtomicBool>,
+    /// When the worker was spawned, and the last frame it published
+    /// (milliseconds after that; 0 = none yet): a grab that blocks forever
+    /// in the driver leaves `alive` set but stops this advancing.
+    started: Instant,
+    last_frame_ms: Arc<AtomicU64>,
 }
+
+/// Devices currently held by a worker, by index: a new worker for the same
+/// device waits for the old thread to let go instead of racing it.
+static HELD: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+
+/// How long a worker may go without a frame before it's considered hung
+/// (longer before the first one: the device is still opening).
+const STALL_AFTER: Duration = Duration::from_secs(3);
+const FIRST_FRAME_WITHIN: Duration = Duration::from_secs(10);
 
 /// Flips `alive` off when the capture thread ends, however it ends.
 struct AliveGuard(Arc<AtomicBool>);
@@ -93,9 +108,26 @@ impl CameraWorker {
         let shared_handle = shared.clone();
         let stop_handle = stop.clone();
         let alive_handle = alive.clone();
+        let last_frame_ms = Arc::new(AtomicU64::new(0));
+        let last_frame_handle = last_frame_ms.clone();
+        let started = Instant::now();
+
+        let key = index.to_string();
+        let previous: Vec<Arc<AtomicBool>> = {
+            let mut held = lock(&HELD);
+            held.retain(|(_, a)| a.load(Ordering::Relaxed));
+            let previous = held.iter().filter(|(k, _)| *k == key).map(|(_, a)| a.clone()).collect();
+            held.push((key, alive.clone()));
+            previous
+        };
         thread::spawn(move || {
             let _guard = AliveGuard(alive_handle);
             let name = format!("cam {index}");
+            // The old worker for this device may still be inside a grab.
+            let waited = Instant::now();
+            while previous.iter().any(|a| a.load(Ordering::Relaxed)) && waited.elapsed() < Duration::from_secs(3) {
+                thread::sleep(Duration::from_millis(50));
+            }
             let requested =
                 RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
             let mut camera = match Camera::new(index, requested) {
@@ -117,7 +149,7 @@ impl CameraWorker {
             while !stop_handle.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
                 let (frame, t_locked) = if SERIALIZE_GRABS.load(Ordering::Relaxed) {
-                    let _guard = FRAME_LOCK.lock().unwrap();
+                    let _guard = lock(&FRAME_LOCK);
                     let t_locked = Instant::now();
                     (camera.frame(), t_locked)
                 } else {
@@ -138,7 +170,7 @@ impl CameraWorker {
                 let res = buffer.resolution();
                 let (width, height) = (res.width_x, res.height_y);
                 let raw = buffer.buffer();
-                let mut data = shared_handle.lock().unwrap().spare.pop().unwrap_or_default();
+                let mut data = lock(&shared_handle).spare.pop().unwrap_or_default();
                 let is_yuyv = buffer.source_frame_format() == FrameFormat::YUYV
                     && width % 2 == 0
                     && raw.len() == (width * height * 2) as usize;
@@ -168,7 +200,8 @@ impl CameraWorker {
                             Pixels::Rgba => "decoded on the CPU",
                         });
                     }
-                    let mut shared = shared_handle.lock().unwrap();
+                    last_frame_handle.store((started.elapsed().as_millis() as u64).max(1), Ordering::Relaxed);
+                    let mut shared = lock(&shared_handle);
                     // Not uploaded yet: the render loop is behind, so this
                     // frame is dropped and its buffer recycled.
                     if let Some(old) = shared.ready.replace(frame) {
@@ -183,11 +216,24 @@ impl CameraWorker {
             dlog!("{name}: stopped");
         });
 
-        CameraWorker { shared, gpu: None, packed: None, stop, alive }
+        CameraWorker { shared, gpu: None, packed: None, stop, alive, started, last_frame_ms }
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Whether the camera has delivered at least one frame.
+    pub fn has_frames(&self) -> bool {
+        self.last_frame_ms.load(Ordering::Relaxed) > 0
+    }
+
+    /// Alive but silent for too long: the grab is hung in the driver.
+    pub fn stalled(&self) -> bool {
+        let age = self.started.elapsed();
+        let last = Duration::from_millis(self.last_frame_ms.load(Ordering::Relaxed));
+        let (silent_for, limit) = if last.is_zero() { (age, FIRST_FRAME_WITHIN) } else { (age.saturating_sub(last), STALL_AFTER) };
+        self.is_alive() && silent_for > limit
     }
 
     /// Uploads the newest captured frame if one arrived since the last
@@ -202,7 +248,8 @@ impl CameraWorker {
         encoder: &mut wgpu::CommandEncoder,
         yuyv: &YuyvPipeline,
     ) -> Option<VideoTex> {
-        let ready = self.shared.lock().unwrap().ready.take();
+        // Never wait on the capture thread: keep showing the current frame.
+        let ready = try_lock(&self.shared).and_then(|mut s| s.ready.take());
         if let Some(f) = ready {
             use wgpu::TextureUsages as U;
             let usage = U::TEXTURE_BINDING | U::COPY_DST | U::RENDER_ATTACHMENT | U::COPY_SRC;
@@ -219,7 +266,9 @@ impl CameraWorker {
                 }
                 Pixels::Rgba => {}
             }
-            self.shared.lock().unwrap().spare.push(f.data);
+            if let Some(mut shared) = try_lock(&self.shared) {
+                shared.spare.push(f.data);
+            }
         }
         self.gpu.clone()
     }
@@ -289,6 +338,9 @@ pub struct CameraState {
     pub wanted: Option<String>,
     pub worker: Option<CameraWorker>,
     pub dropdown_open: bool,
+    /// After a capture failure: consecutive failures and when to try again.
+    pub failures: u32,
+    pub retry_at: Option<Instant>,
 }
 
 impl CameraState {
@@ -299,6 +351,8 @@ impl CameraState {
             wanted: None,
             worker: None,
             dropdown_open: false,
+            failures: 0,
+            retry_at: None,
         }
     }
 
@@ -318,6 +372,8 @@ impl CameraState {
         self.selected = choice;
         self.wanted = choice.and_then(|i| available.get(i)).map(|c| c.human_name().to_string());
         self.worker = None;
+        self.failures = 0;
+        self.retry_at = None;
         self.chrome.preview_texture = None;
     }
 
@@ -376,12 +432,13 @@ fn dedupe_cameras(cameras: Vec<CameraInfo>) -> Vec<CameraInfo> {
 /// one that actually produces a frame, falling back to the first candidate
 /// if none of them do (so it still shows up, even if non-functional).
 fn pick_working_camera(candidates: Vec<CameraInfo>) -> CameraInfo {
-    for candidate in &candidates {
-        if camera_produces_frame(candidate.index().clone()) {
-            return candidate.clone();
-        }
-    }
-    candidates.into_iter().next().expect("at least one candidate per group")
+    find_working_camera(&candidates)
+        .or_else(|| candidates.into_iter().next())
+        .expect("at least one candidate per group")
+}
+
+fn find_working_camera(candidates: &[CameraInfo]) -> Option<CameraInfo> {
+    candidates.iter().find(|c| camera_produces_frame(c.index().clone())).cloned()
 }
 
 fn camera_produces_frame(index: CameraIndex) -> bool {
@@ -400,7 +457,6 @@ fn camera_produces_frame(index: CameraIndex) -> bool {
             let mut last_err = None;
             for _ in 0..8 {
                 let result = {
-                    let _guard = FRAME_LOCK.lock().unwrap();
                     camera.frame()
                 };
                 match result {
@@ -447,13 +503,15 @@ impl CameraWatcher {
 
                 let current: Vec<CameraInfo> = groups
                     .into_iter()
-                    .map(|(name, candidates)| {
-                        let still_there = known
-                            .iter()
-                            .find(|k| k.human_name() == name && candidates.iter().any(|c| c.index() == k.index()));
+                    .filter_map(|(name, candidates)| {
+                        let same_name = known.iter().find(|k| k.human_name() == name);
+                        let still_there = same_name.filter(|k| candidates.iter().any(|c| c.index() == k.index()));
                         match still_there {
-                            Some(k) => k.clone(),
-                            None => pick_working_camera(candidates),
+                            Some(k) => Some(k.clone()),
+                            // A node that can't be probed may just be busy
+                            // streaming: keep what we knew rather than
+                            // swapping in an unprobed (maybe metadata) node.
+                            None => find_working_camera(&candidates).or_else(|| same_name.cloned()),
                         }
                     })
                     .collect();

@@ -91,24 +91,83 @@ pub struct ParsedShader {
     pub body: String,
 }
 
-/// File names (not paths) of every `.glsl`/`.frag` in the shaders folder, sorted.
-pub fn scan_library() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(SHADER_DIR)
+/// Which shader node lists a file. `Any` is the legacy catch-all node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderRole {
+    Any,
+    Generator,
+    Effect,
+    Feedback,
+    Mix,
+}
+
+impl ShaderRole {
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "generator" => Some(ShaderRole::Generator),
+            "effect" => Some(ShaderRole::Effect),
+            "feedback" => Some(ShaderRole::Feedback),
+            "mix" => Some(ShaderRole::Mix),
+            _ => None,
+        }
+    }
+
+    /// Whether a node of role `self` lists a file of role `file`.
+    pub fn lists(self, file: ShaderRole) -> bool {
+        self == ShaderRole::Any || self == file
+    }
+}
+
+/// A file of the shaders folder and where it is listed.
+#[derive(Debug, Clone)]
+pub struct ShaderInfo {
+    pub file: String,
+    pub category: String,
+    pub role: ShaderRole,
+}
+
+/// Reads the `// @category X` / `// @role Y` lines at the top of a file. A
+/// missing role is inferred from what the code uses.
+fn read_info(file: String, source: &str) -> ShaderInfo {
+    let mut category = None;
+    let mut role = None;
+    for line in source.lines() {
+        let Some(comment) = line.trim_start().strip_prefix("//") else { break };
+        let comment = comment.trim();
+        if let Some(c) = comment.strip_prefix("@category") {
+            category = Some(c.trim().to_string()).filter(|c| !c.is_empty());
+        } else if let Some(r) = comment.strip_prefix("@role") {
+            role = ShaderRole::from_tag(r);
+        }
+    }
+    let role = role.unwrap_or_else(|| match parse_shader(source) {
+        Ok(p) if p.feedback => ShaderRole::Feedback,
+        Ok(p) if p.channels == 0 => ShaderRole::Generator,
+        Ok(p) if p.channels > 2 => ShaderRole::Mix,
+        _ => ShaderRole::Effect,
+    });
+    ShaderInfo { file, category: category.unwrap_or_else(|| "Other".to_string()), role }
+}
+
+/// Every `.glsl`/`.frag` in the shaders folder, sorted by category then name.
+pub fn scan_library() -> Vec<ShaderInfo> {
+    let mut infos: Vec<ShaderInfo> = std::fs::read_dir(SHADER_DIR)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
             let path = e.path();
             let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-            if ext == "glsl" || ext == "frag" {
-                Some(path.file_name()?.to_str()?.to_string())
-            } else {
-                None
+            if ext != "glsl" && ext != "frag" {
+                return None;
             }
+            let name = path.file_name()?.to_str()?.to_string();
+            let source = std::fs::read_to_string(&path).unwrap_or_default();
+            Some(read_info(name, &source))
         })
         .collect();
-    names.sort();
-    names
+    infos.sort_by(|a, b| (&a.category, &a.file).cmp(&(&b.category, &b.file)));
+    infos
 }
 
 pub fn shader_path(file: &str) -> PathBuf {

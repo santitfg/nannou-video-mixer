@@ -27,7 +27,7 @@ pub fn push(message: String) {
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f32();
     let line = format!("[{t:8.2}] {message}");
     eprintln!("{line}");
-    let mut lines = LINES.lock().unwrap();
+    let mut lines = crate::sync::lock(&LINES);
     if lines.len() == CAPACITY {
         lines.pop_front();
     }
@@ -36,7 +36,7 @@ pub fn push(message: String) {
 
 /// The newest `n` lines, oldest first.
 pub fn recent(n: usize) -> Vec<String> {
-    let lines = LINES.lock().unwrap();
+    let lines = crate::sync::lock(&LINES);
     lines.iter().skip(lines.len().saturating_sub(n)).cloned().collect()
 }
 

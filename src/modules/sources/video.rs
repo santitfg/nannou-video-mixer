@@ -18,6 +18,7 @@
 //! step.
 
 use crate::dlog;
+use crate::sync::{lock, try_lock};
 use crate::gpu::{ensure_plane, ensure_target, uniform_buffer, write_plane, VideoTex, Yuv420Pipeline};
 use crate::modules::param::Param;
 use crate::ModuleChrome;
@@ -119,6 +120,11 @@ pub struct VideoWorker {
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     thread: thread::Thread,
+    /// False once the decoding thread has ended (finished, failed or crashed).
+    alive: Arc<AtomicBool>,
+    /// Set by `request` when the playhead moves, to cut short speculative
+    /// decoding (prefetch) that is no longer where the playhead is heading.
+    moved: Arc<AtomicBool>,
     uploaded: Option<i64>,
     planes: [Option<VideoTex>; 3],
     out: Option<VideoTex>,
@@ -129,8 +135,12 @@ impl VideoWorker {
     pub fn spawn(path: PathBuf) -> Self {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let moved = Arc::new(AtomicBool::new(false));
         let (shared_handle, stop_handle) = (shared.clone(), stop.clone());
+        let (alive_handle, moved_handle) = (alive.clone(), moved.clone());
         let handle = thread::spawn(move || {
+            let _guard = AliveGuard(alive_handle);
             let name = path.file_name().map_or_else(|| "video".into(), |n| n.to_string_lossy().to_string());
             match Player::open(&path, CACHE_BUDGET) {
                 Ok(player) => {
@@ -143,34 +153,46 @@ impl VideoWorker {
                         info.frames,
                         if info.bt709 { "BT.709" } else { "BT.601" }
                     );
-                    shared_handle.lock().unwrap().info = Some(info);
-                    run(player, &shared_handle, &stop_handle, &name);
+                    lock(&shared_handle).info = Some(info);
+                    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(player, &shared_handle, &stop_handle, &moved_handle, &name)
+                    }))
+                    .is_err();
+                    if crashed {
+                        dlog!("{name}: decoder crashed");
+                    }
                 }
                 Err(err) => {
                     dlog!("{name}: {err}");
-                    shared_handle.lock().unwrap().error = Some(err);
+                    lock(&shared_handle).error = Some(err);
                 }
             }
         });
-        VideoWorker { shared, stop, thread: handle.thread().clone(), uploaded: None, planes: [None, None, None], out: None, uniform: None }
+        VideoWorker { shared, stop, thread: handle.thread().clone(), alive, moved, uploaded: None, planes: [None, None, None], out: None, uniform: None }
     }
 
     pub fn info(&self) -> Option<VideoInfo> {
-        self.shared.lock().unwrap().info
+        lock(&self.shared).info
+    }
+
+    /// Whether the decoding thread is still running.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     pub fn error(&self) -> Option<String> {
-        self.shared.lock().unwrap().error.clone()
+        lock(&self.shared).error.clone()
     }
 
     /// Points the decoder at `frame` (and tells it which way we're going,
     /// so it can prepare what comes next).
     pub fn request(&self, frame: i64, direction: i8) {
-        let mut shared = self.shared.lock().unwrap();
+        let mut shared = lock(&self.shared);
         if shared.wanted != frame || shared.direction != direction {
             shared.wanted = frame;
             shared.direction = direction;
             drop(shared);
+            self.moved.store(true, Ordering::Relaxed);
             self.thread.unpark();
         }
     }
@@ -185,9 +207,9 @@ impl VideoWorker {
         encoder: &mut wgpu::CommandEncoder,
         pipeline: &Yuv420Pipeline,
     ) -> Option<VideoTex> {
-        let (frame, info) = {
-            let shared = self.shared.lock().unwrap();
-            (shared.ready.clone(), shared.info)
+        // Never wait on the decoder: keep showing the current frame.
+        let Some((frame, info)) = try_lock(&self.shared).map(|s| (s.ready.clone(), s.info)) else {
+            return self.out.clone();
         };
         let (Some(frame), Some(info)) = (frame, info) else { return self.out.clone() };
         if self.uploaded == Some(frame.index) && self.out.is_some() {
@@ -217,24 +239,55 @@ impl Drop for VideoWorker {
     }
 }
 
+/// Flips `alive` off when the decoding thread ends, however it ends.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// How many times a frame that couldn't be produced is retried before the
+/// decoder gives up on it and waits for the playhead to move.
+const MAX_SERVE_ATTEMPTS: u32 = 3;
+
 /// The decoding thread: serve the wanted frame, then use idle time to
 /// prepare the frames the playhead is heading to.
-fn run(mut player: Player, shared: &Mutex<Shared>, stop: &AtomicBool, name: &str) {
+fn run(mut player: Player, shared: &Mutex<Shared>, stop: &Arc<AtomicBool>, moved: &Arc<AtomicBool>, name: &str) {
+    player.stop = Some(stop.clone());
+    player.moved = Some(moved.clone());
     let mut served: Option<i64> = None;
+    let mut attempts = 0u32;
     let mut stats = Stats::new();
     while !stop.load(Ordering::Relaxed) {
+        // Cleared before reading the playhead, so a request that lands
+        // afterwards is never lost.
+        moved.store(false, Ordering::Relaxed);
         let (wanted, direction) = {
-            let s = shared.lock().unwrap();
+            let s = lock(shared);
             (s.wanted.clamp(0, (player.info.frames - 1).max(0)), s.direction)
         };
         if served != Some(wanted) {
             let t = Instant::now();
             let frame = player.get(wanted, direction);
             stats.serve(t.elapsed(), player.cache.contains_key(&wanted));
-            if let Some(frame) = frame {
-                shared.lock().unwrap().ready = Some(frame);
+            match frame {
+                Some(frame) => {
+                    lock(shared).ready = Some(frame);
+                    served = Some(wanted);
+                    attempts = 0;
+                }
+                None => {
+                    attempts += 1;
+                    if attempts >= MAX_SERVE_ATTEMPTS {
+                        served = Some(wanted);
+                        attempts = 0;
+                    } else {
+                        thread::park_timeout(Duration::from_millis(20));
+                    }
+                }
             }
-            served = Some(wanted);
         } else if !player.prefetch(wanted, direction) {
             thread::park_timeout(Duration::from_millis(10));
         }
@@ -260,6 +313,9 @@ struct Player {
     budget: usize,
     seeks: u32,
     decoded: u32,
+    /// Set once the thread runs: whether to give up decoding early.
+    stop: Option<Arc<AtomicBool>>,
+    moved: Option<Arc<AtomicBool>>,
 }
 
 impl Player {
@@ -310,6 +366,8 @@ impl Player {
             budget,
             seeks: 0,
             decoded: 0,
+            stop: None,
+            moved: None,
         })
     }
 
@@ -331,13 +389,14 @@ impl Player {
         // Playing backwards keeps as much behind the target as fits, so the
         // next requests (index-1, index-2, ...) are already decoded.
         let behind = if direction < 0 { self.budget_frames() - PREFETCH_AHEAD } else { KEEP_BEHIND_FORWARD };
-        self.decode_to(index, behind);
+        self.decode_to(index, behind, false);
         self.evict(index);
         self.nearest(index)
     }
 
     /// Decodes up to `index`, keeping frames from `index - behind` on.
-    fn decode_to(&mut self, index: i64, behind: i64) {
+    /// With `speculative`, also stops as soon as the playhead moves.
+    fn decode_to(&mut self, index: i64, behind: i64, speculative: bool) {
         let close_ahead = self.next.is_some_and(|n| n <= index && index - n <= SEEK_AHEAD) && !self.eof;
         if !close_ahead {
             self.seek(index);
@@ -345,6 +404,11 @@ impl Player {
         let keep_from = index - behind.max(0);
         let mut decoded = ffmpeg::frame::Video::empty();
         loop {
+            let stop = self.stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
+            let moved = speculative && self.moved.as_ref().is_some_and(|m| m.load(Ordering::Relaxed));
+            if stop || moved {
+                break;
+            }
             match self.decode_next(&mut decoded) {
                 Some(i) => {
                     self.next = Some(i + 1);
@@ -377,14 +441,22 @@ impl Player {
         self.seeks += 1;
     }
 
+    /// A decoded frame's index from its timestamp; files without timestamps
+    /// just count on from the previous frame.
+    fn index_of(&self, frame: &ffmpeg::frame::Video) -> i64 {
+        match frame.timestamp() {
+            Some(ts) => (((ts - self.start) as f64 * self.time_base) * self.info.fps).round() as i64,
+            None => self.next.unwrap_or(0),
+        }
+    }
+
     /// The next decoded frame's index, reading packets as needed; `None` at
     /// the end of the file.
     fn decode_next(&mut self, frame: &mut ffmpeg::frame::Video) -> Option<i64> {
         loop {
             if self.decoder.receive_frame(frame).is_ok() {
                 self.decoded += 1;
-                let ts = frame.timestamp().unwrap_or(0);
-                return Some((((ts - self.start) as f64 * self.time_base) * self.info.fps).round() as i64);
+                return Some(self.index_of(frame));
             }
             if self.eof {
                 return None;
@@ -401,8 +473,7 @@ impl Player {
                     // Drain whatever the decoder still holds.
                     if self.decoder.receive_frame(frame).is_ok() {
                         self.decoded += 1;
-                        let ts = frame.timestamp().unwrap_or(0);
-                        return Some((((ts - self.start) as f64 * self.time_base) * self.info.fps).round() as i64);
+                        return Some(self.index_of(frame));
                     }
                     return None;
                 }
@@ -452,8 +523,9 @@ impl Player {
     /// Drops the frames farthest from `index` until the cache fits its budget.
     fn evict(&mut self, index: i64) {
         while self.cache_bytes > self.budget && self.cache.len() > 1 {
-            let (&first, _) = self.cache.first_key_value().unwrap();
-            let (&last, _) = self.cache.last_key_value().unwrap();
+            let (Some((&first, _)), Some((&last, _))) = (self.cache.first_key_value(), self.cache.last_key_value()) else {
+                break;
+            };
             let victim = if (index - first).abs() >= (last - index).abs() { first } else { last };
             if victim == index {
                 break;
@@ -481,7 +553,7 @@ impl Player {
             if self.cache.contains_key(&target) || self.eof {
                 return false;
             }
-            self.decode_to(target, KEEP_BEHIND_FORWARD + PREFETCH_AHEAD);
+            self.decode_to(target, KEEP_BEHIND_FORWARD + PREFETCH_AHEAD, true);
             self.evict(index);
             true
         } else if direction < 0 {
@@ -497,7 +569,7 @@ impl Player {
             // Decode the window that ends just before `low`, keeping `index`'s
             // run: evict around the playhead, not around the new window.
             let window = (self.budget_frames() - (index - low) - 1).max(1);
-            self.decode_to(low - 1, window);
+            self.decode_to(low - 1, window, true);
             self.evict(index);
             true
         } else {
@@ -573,6 +645,8 @@ pub struct VideoState {
     pub bounce: f64,
     pub dropdown_open: bool,
     pub info: Option<VideoInfo>,
+    /// After the decoder died: when to start a new one.
+    pub retry_at: Option<Instant>,
 }
 
 impl VideoState {
@@ -588,6 +662,7 @@ impl VideoState {
             bounce: 1.0,
             dropdown_open: false,
             info: None,
+            retry_at: None,
         }
     }
 

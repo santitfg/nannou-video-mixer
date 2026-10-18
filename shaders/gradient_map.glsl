@@ -1,3 +1,5 @@
+// @category Color
+// @role effect
 // Recolors the image by brightness through a color ramp (like a lookup table).
 Properties {
     _Palette ("Palette", Enum(Fire, Ocean, Neon, Mono, Sunset)) = 0

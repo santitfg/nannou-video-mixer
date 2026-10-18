@@ -1,3 +1,5 @@
+// @category Distortion
+// @role effect
 // Mirrors one half of iChannel0 onto the other, or one quadrant onto all four.
 Properties {
     _Mode ("Mode", Enum(Left, Right, Top, Bottom, Quad)) = 0

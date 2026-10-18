@@ -1,3 +1,5 @@
+// @category Distortion
+// @role effect
 // Twists the image around the center; strongest in the middle.
 Properties {
     _Angle  ("Angle", Range(-10, 10)) = 3.0

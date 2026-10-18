@@ -1,3 +1,5 @@
+// @category Distortion
+// @role effect
 // Repeats the image in a grid; Mirror flips every other tile so seams match.
 Properties {
     _RepeatX ("Repeat X", Range(1, 10)) = 2.0

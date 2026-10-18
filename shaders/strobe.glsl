@@ -1,3 +1,5 @@
+// @category Glitch
+// @role effect
 // Flashes Rate times a second: white, black, or the inverted image.
 // Duty is how much of each flash cycle is "on".
 Properties {

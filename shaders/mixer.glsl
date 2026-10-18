@@ -1,3 +1,5 @@
+// @category Mixing
+// @role mix
 // Four-input video mixer: a level for each input, and how they combine.
 // Switch crossfades between inputs by Select (0..3), like a vision mixer.
 // Unplugged inputs are ignored.
