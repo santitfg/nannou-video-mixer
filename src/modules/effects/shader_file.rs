@@ -410,6 +410,25 @@ mod tests {
         assert!(parse_shader("Properties { _M (\"m\", Enum()) = 0 }").is_err());
     }
 
+    /// The sidebar lists one entry per (category, role), so a category name
+    /// used by two roles shows up twice ("Color" under Effects twice) and
+    /// the nodes' lists blur together. Each category belongs to one role:
+    /// give the other role's shaders a category of their own.
+    #[test]
+    fn bundled_categories_belong_to_one_role() {
+        let library = scan_library();
+        for info in &library {
+            let clash = library.iter().find(|o| o.category == info.category && o.role != info.role);
+            assert!(
+                clash.is_none(),
+                "category '{}' is used by two roles ({} and {}); rename one",
+                info.category,
+                info.file,
+                clash.map_or("", |o| o.file.as_str())
+            );
+        }
+    }
+
     #[test]
     fn rejects_bad_type() {
         assert!(parse_shader("Properties { _A (\"x\", Vector) = 1 }").is_err());

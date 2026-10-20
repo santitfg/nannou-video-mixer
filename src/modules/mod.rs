@@ -328,6 +328,8 @@ pub struct PlacedModule {
 pub const SHADER_PORT_STEP: f32 = 24.0;
 /// Where a Shader's first port sits, measured down from the top of the box.
 pub const SHADER_PORT_TOP: f32 = 84.0;
+/// How far a Shader's ports move up when it has no selector row.
+pub const SHADER_PICKER_H: f32 = 36.0;
 /// Where a WLED module's input rows start, and how tall each is.
 pub const WLED_ROWS_TOP: f32 = 96.0;
 pub const WLED_ROW_H: f32 = 26.0;
@@ -342,11 +344,21 @@ impl PlacedModule {
         }
     }
 
+    /// How much higher than usual this module's input ports sit (a shader
+    /// with a single choice has no selector row).
+    pub fn port_shift(&self) -> f32 {
+        match &self.body {
+            ModuleBody::Shader(s) if s.single_choice && s.file.is_some() => SHADER_PICKER_H,
+            _ => 0.0,
+        }
+    }
+
     pub fn base_height(&self) -> f32 {
         match &self.body {
             ModuleBody::Shader(s) => {
                 let ports = s.input_types().len() as f32;
-                (SHADER_PORT_TOP + ports * SHADER_PORT_STEP + 4.0).max(base_height(self.kind))
+                let shift = self.port_shift();
+                (SHADER_PORT_TOP - shift + ports * SHADER_PORT_STEP + 4.0).max(base_height(self.kind) - shift)
             }
             ModuleBody::Wled(w) => WLED_ROWS_TOP + w.inputs.len().max(1) as f32 * WLED_ROW_H + 40.0,
             _ => base_height(self.kind),

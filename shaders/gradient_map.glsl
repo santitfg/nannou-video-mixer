@@ -1,6 +1,9 @@
 // @category Color
 // @role effect
 // Recolors the image by brightness through a color ramp (like a lookup table).
+// The ramp is the built-in Palette, or any image plugged into the second
+// input (its left edge = dark, its right edge = bright): a Color Ramp, a
+// picture, a video...
 Properties {
     _Palette ("Palette", Enum(Fire, Ocean, Neon, Mono, Sunset)) = 0
     _Shift   ("Shift", Range(0, 1)) = 0.0
@@ -17,7 +20,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec3 src = texture(iChannel0, uv).rgb;
     float t = fract(dot(src, vec3(0.299, 0.587, 0.114)) + _Shift);
     vec3 ramp;
-    if (_Palette == 0) {
+    if (iChannelResolution[1].x > 0.0) {
+        ramp = texture(iChannel1, vec2(t, 0.5)).rgb;
+    } else if (_Palette == 0) {
         ramp = clamp(vec3(t * 3.0, t * 3.0 - 1.0, t * 3.0 - 2.0), 0.0, 1.0);
     } else if (_Palette == 1) {
         ramp = cosine(t, vec3(0.0, 0.3, 0.5), vec3(0.2, 0.4, 0.5), vec3(1.0), vec3(0.0, 0.1, 0.2));

@@ -539,6 +539,12 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     // stop autodetected libraries enabling themselves, causing linking errors
     configure.arg("--disable-autodetect");
 
+    // PNG (and other zlib-based) decoders need zlib; macOS and Linux ship it.
+    // (Local patch; see [patch.crates-io] in the project's Cargo.toml.)
+    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "linux") {
+        configure.arg("--enable-zlib");
+    }
+
     // do not build programs since we don't need them
     configure.arg("--disable-programs");
 
@@ -1077,7 +1083,7 @@ fn link_to_libraries(statik: bool, target_os: &str) {
     ) {
         println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
     }
-    if env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && target_os == "linux" {
+    if target_os == "macos" || (env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && target_os == "linux") {
         println!("cargo:rustc-link-lib=z");
     }
 }

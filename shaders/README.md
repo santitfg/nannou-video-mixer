@@ -16,6 +16,12 @@ The first lines of a file can declare where it is listed:
 ```
 
 * `@category`: the group heading in the dropdown (free text; default `Other`).
+* **One category, one role.** Never reuse a category name across roles
+  (e.g. a `generator` and an `effect` both in `Color`): the sidebar lists a
+  separate entry per (category, role), so the name appears twice. Give the
+  other role its own category (`Palettes` for the color ramp generator) and
+  check the sidebar before creating or merging categories. A unit test
+  (`bundled_categories_belong_to_one_role`) fails on a clash.
 * `@role`: which node lists it: `generator` (no input), `effect` (one video
   input), `feedback` (reads `iFeedback`) or `mix` (several inputs). When
   omitted it is inferred from the code.

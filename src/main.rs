@@ -620,6 +620,15 @@ fn update(app: &App, model: &mut Model, update: Update) {
         }
     }
 
+    // A shader node whose list holds one shader has nothing to pick.
+    for module in &mut model.modules {
+        if let (ModuleBody::Shader(sh), Some(role)) = (&mut module.body, module.kind.shader_role()) {
+            sh.single_choice = sh.category.as_deref().is_some_and(|c| {
+                model.shader_library.iter().filter(|i| i.category == c && role.lists(i.role)).count() == 1
+            });
+        }
+    }
+
     // Cameras plugged in or out while running: adopt the new list and
     // re-attach every Camera module to its device by name.
     while let Ok(list) = model.camera_watcher.updates.try_recv() {
@@ -1377,7 +1386,7 @@ fn param_rect(module: &PlacedModule, slot: Slot) -> Rect {
         Slot::Prop(i) => {
             let inputs = module.input_types().len();
             let channels = inputs.saturating_sub(param_slots(module).len());
-            let port = module_input_port(module.kind, body, channels + i, inputs);
+            let port = module_input_port(module, body, channels + i, inputs);
             Rect::from_corners(
                 pt2(body.left() + 20.0, port.y - PROP_BOX_H / 2.0),
                 pt2(body.right() - 12.0, port.y + PROP_BOX_H / 2.0),
@@ -2569,7 +2578,7 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             if config_rect(body).contains(mouse) {
                 let module = model.modules[i].id;
                 open_dialog(model, move || {
-                    pollster::block_on(rfd::AsyncFileDialog::new().add_filter("Video", VIDEO_EXTENSIONS).pick_file())
+                    pollster::block_on(rfd::AsyncFileDialog::new().add_filter("Video / image", VIDEO_EXTENSIONS).pick_file())
                         .map(|f| DialogReply::Video { module, path: f.path().to_path_buf() })
                 });
                 return;
@@ -2582,7 +2591,7 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
                 video.playing = !video.playing;
                 return;
             }
-            if video_loop_rect(body).contains(mouse) {
+            if !video.is_still() && video_loop_rect(body).contains(mouse) {
                 video.dropdown_open = true;
                 return;
             }
@@ -2600,7 +2609,7 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
                         cam.dropdown_open = true;
                     }
                 }
-                ModuleBody::Shader(shader) => {
+                ModuleBody::Shader(shader) if shader.file.is_none() || !shader.single_choice => {
                     shader.dropdown_open = true;
                     model.shader_library = scan_library();
                 }
@@ -2615,7 +2624,7 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
         }
 
         let inputs = model.modules[i].input_types().len();
-        if let Some(input_index) = (0..inputs).find(|&n| port_hit(kind, body, n, inputs, mouse)) {
+        if let Some(input_index) = (0..inputs).find(|&n| port_hit(&model.modules[i], body, n, inputs, mouse)) {
             // A multi-input pill opens its order menu instead of picking a cable up.
             if multi_input::is_multi(kind, input_index) {
                 if !multi_input::sources(&model.connections, id, input_index).is_empty() {
@@ -2803,7 +2812,7 @@ fn handle_release(app: &App, model: &mut Model) {
             if *port_type != from_type {
                 continue;
             }
-            if port_hit(module.kind, body, input_index, types.len(), mouse) {
+            if port_hit(module, body, input_index, types.len(), mouse) {
                 target = Some((module.id, input_index));
                 break;
             }
@@ -2874,7 +2883,8 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
         let open = !module.body.chrome().minimized;
         let on_selector = open
             && match &module.body {
-                ModuleBody::Camera(_) | ModuleBody::Shader(_) => config_rect(body).contains(world),
+                ModuleBody::Camera(_) => config_rect(body).contains(world),
+                ModuleBody::Shader(sh) => (sh.file.is_none() || !sh.single_choice) && config_rect(body).contains(world),
                 ModuleBody::Lfo(_) => mode_rect(module.kind, body).contains(world) || lfo_center_rect(body).contains(world),
                 ModuleBody::Wled(w) => config_rect(body).contains(world) || (0..w.inputs.len()).any(|r| wled_input_rect(body, r).contains(world)),
                 ModuleBody::Map(_) => map_button_at(body, world).is_some(),
@@ -2886,7 +2896,7 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
             };
         let inputs = module.input_types().len();
         let on_port = (has_output(module.kind) && world.distance(module_output_port(body)) <= PORT_HIT_RADIUS)
-            || (0..inputs).any(|n| port_hit(module.kind, body, n, inputs, world));
+            || (0..inputs).any(|n| port_hit(module, body, n, inputs, world));
         if on_title_button || on_selector || on_port {
             return CursorIcon::Hand;
         }
@@ -3461,7 +3471,9 @@ fn video_scrub_rect(body: Rect) -> Rect {
 }
 
 const VIDEO_EXTENSIONS: &[&str] =
-    &["mp4", "mov", "m4v", "mkv", "avi", "webm", "mpg", "mpeg", "mts", "m2ts", "ts", "wmv", "flv", "mxf", "gif"];
+    &["mp4", "mov", "m4v", "mkv", "avi", "webm", "mpg", "mpeg", "mts", "m2ts", "ts", "wmv", "flv", "mxf", "gif",
+      // Still images: a one-frame "video".
+      "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"];
 
 fn is_video_file(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
@@ -3586,7 +3598,8 @@ fn is_minimized_body(body: Rect) -> bool {
 
 /// Input ports are spaced evenly down the left edge; a single input sits
 /// dead center, matching every module that used to have exactly one.
-fn module_input_port(kind: ModuleKind, body: Rect, index: usize, total: usize) -> Point2 {
+fn module_input_port(module: &PlacedModule, body: Rect, index: usize, total: usize) -> Point2 {
+    let kind = module.kind;
     // A Stack's layers plug into one pill; its mix input hangs below it.
     if kind == ModuleKind::Stack {
         if is_minimized_body(body) {
@@ -3599,7 +3612,7 @@ fn module_input_port(kind: ModuleKind, body: Rect, index: usize, total: usize) -
         if is_minimized_body(body) {
             return pt2(body.left(), body.top() - MINIMIZED_H / 2.0);
         }
-        return pt2(body.left(), body.top() - SHADER_PORT_TOP - index as f32 * SHADER_PORT_STEP);
+        return pt2(body.left(), body.top() - SHADER_PORT_TOP + module.port_shift() - index as f32 * SHADER_PORT_STEP);
     }
     if total <= 1 {
         if is_minimized_body(body) {
@@ -3635,11 +3648,11 @@ fn pill_slot(body: Rect, k: usize, n: usize) -> Point2 {
 }
 
 /// Whether `p` is on input `index` (a multi-input's pill is a bigger target).
-fn port_hit(kind: ModuleKind, body: Rect, index: usize, total: usize, p: Point2) -> bool {
-    if multi_input::is_multi(kind, index) {
+fn port_hit(module: &PlacedModule, body: Rect, index: usize, total: usize, p: Point2) -> bool {
+    if multi_input::is_multi(module.kind, index) {
         return pill_rect(body).pad(-4.0).contains(p);
     }
-    p.distance(module_input_port(kind, body, index, total)) <= PORT_HIT_RADIUS
+    p.distance(module_input_port(module, body, index, total)) <= PORT_HIT_RADIUS
 }
 
 fn draw_pill(draw: &Draw, t: &Theme, body: Rect, layers: usize, hovered: bool) {
@@ -4098,7 +4111,9 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
                         (None, Some(category)) => format!("Select {category}"),
                         (None, None) => "Select a shader".to_string(),
                     };
-                    ui::selector(draw, t, config, &label, hovered(config) || shader.dropdown_open);
+                    if shader.file.is_none() || !shader.single_choice {
+                        ui::selector(draw, t, config, &label, hovered(config) || shader.dropdown_open);
+                    }
                 }
                 ModuleBody::Mult(_) => {
                     let value = module_number(&model.modules, &model.connections, module.id, now, &mut Vec::new());
@@ -4167,7 +4182,7 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
 
     let types = module.input_types();
     for (i, port_type) in types.iter().enumerate() {
-        let pos = module_input_port(module.kind, body, i, types.len());
+        let pos = module_input_port(module, body, i, types.len());
         let connected = model.connections.iter().any(|c| c.to == module.id && c.to_input == i);
         if multi_input::is_multi(module.kind, i) {
             let layers = multi_input::sources(&model.connections, module.id, i).len();
@@ -4179,14 +4194,14 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
 
     if let (ModuleBody::Shader(shader), false) = (&module.body, chrome.minimized) {
         for n in 0..shader.channels() {
-            let port = module_input_port(module.kind, body, n, types.len());
+            let port = module_input_port(module, body, n, types.len());
             let rect = Rect::from_corners(pt2(body.left() + 20.0, port.y - 9.0), pt2(body.right() - 12.0, port.y + 9.0));
             ui::label_left(draw, rect.pad_left(-10.0), &if shader.channels() == 1 { "Imagen In".to_string() } else { format!("Imagen In {}", n + 1) }, t.title_text, 11);
         }
         if let Some(error) = &shader.error {
             // Sits under the ports; the full text is also readable by
             // fixing the file, since the shader reloads on save.
-            let ports_bottom = body.top() - SHADER_PORT_TOP - types.len() as f32 * SHADER_PORT_STEP;
+            let ports_bottom = body.top() - SHADER_PORT_TOP + module.port_shift() - types.len() as f32 * SHADER_PORT_STEP;
             draw.text(error)
                 .xy(pt2(body.x(), ports_bottom - 30.0))
                 .wh(vec2(body.w() - 16.0, 56.0))
@@ -4268,7 +4283,9 @@ fn draw_video_controls(draw: &Draw, t: &Theme, model: &Model, id: u64, video: &V
     }
 
     let loop_rect = video_loop_rect(body);
-    ui::selector_sized(draw, t, loop_rect, video.looping.name(), hovered(loop_rect) || video.dropdown_open, 11);
+    if !video.is_still() {
+        ui::selector_sized(draw, t, loop_rect, video.looping.name(), hovered(loop_rect) || video.dropdown_open, 11);
+    }
 
     let time = video_time_rect(body);
     let error = video.worker.as_ref().and_then(|w| w.error());
@@ -4611,7 +4628,7 @@ fn cable_ends(model: &Model, c: &Connection) -> Option<(Point2, Point2)> {
                 let k = layers.iter().position(|s| *s == c.from).unwrap_or(0);
                 return pill_slot(body, k, layers.len());
             }
-            module_input_port(to.kind, body, c.to_input, to_inputs)
+            module_input_port(to, body, c.to_input, to_inputs)
         },
         |(_, f)| group::collapsed_port(f, false),
     );
@@ -4650,7 +4667,7 @@ fn over_any_input_port(model: &Model, from: u64, world: Point2) -> bool {
     model.modules.iter().filter(|m| !model.hidden(m.id)).any(|m| {
         let types = m.input_types();
         let body = module_body_rect(m);
-        types.iter().enumerate().any(|(i, ty)| *ty == from_type && port_hit(m.kind, body, i, types.len(), world))
+        types.iter().enumerate().any(|(i, ty)| *ty == from_type && port_hit(m, body, i, types.len(), world))
     })
 }
 

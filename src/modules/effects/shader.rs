@@ -25,6 +25,9 @@ pub struct ShaderState {
     /// category entry). `None` lists every shader of the node's role.
     pub category: Option<String>,
     pub dropdown_open: bool,
+    /// The node's list has a single shader: nothing to pick, so the
+    /// selector is hidden and the ports move up into its row.
+    pub single_choice: bool,
     /// The `Enum` property whose options dropdown is open.
     pub prop_dropdown: Option<usize>,
     pub compiled: Option<Compiled>,
@@ -49,6 +52,7 @@ impl ShaderState {
             file: None,
             category: None,
             dropdown_open: false,
+            single_choice: false,
             prop_dropdown: None,
             compiled: None,
             error: None,

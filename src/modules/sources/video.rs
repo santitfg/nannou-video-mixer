@@ -671,6 +671,11 @@ impl VideoState {
         }
     }
 
+    /// A still image (or one-frame clip): nothing to loop or scrub.
+    pub fn is_still(&self) -> bool {
+        self.info.is_some_and(|i| i.frames <= 1)
+    }
+
     pub fn file_name(&self) -> Option<String> {
         self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string())
     }
@@ -849,6 +854,29 @@ mod tests {
     #[test]
     fn forward_backward_and_random_access_hit_the_right_frames() {
         access_test(clip("access", 60));
+    }
+
+    #[test]
+    fn still_images_are_one_frame_clips() {
+        let dir = std::env::temp_dir();
+        for ext in ["png", "jpg"] {
+            let path = dir.join(format!("nvm-still-{}.{ext}", std::process::id()));
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=gray:s=64x48", "-frames:v", "1"])
+                .arg(&path)
+                .status();
+            if !status.is_ok_and(|s| s.success()) {
+                return; // no ffmpeg binary around
+            }
+            let mut player = Player::open(&path, CACHE_BUDGET).unwrap();
+            assert_eq!(player.info.frames, 1, "{ext}");
+            assert_eq!((player.info.width, player.info.height), (64, 48));
+            for (i, dir) in [(0, 1), (0, -1), (0, 0)] {
+                let f = player.get(i, dir).unwrap_or_else(|| panic!("{ext}: no frame"));
+                assert!((luma(&f) as i32 - 128).abs() < 8);
+            }
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
