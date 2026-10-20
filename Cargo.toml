@@ -31,3 +31,8 @@ opt-level = 3
 # keep our own code debuggable but build dependencies with optimizations.
 [profile.dev.package."*"]
 opt-level = 3
+
+# ffmpeg-sys-next 9.0.1 passes --target-os=macos when cross-compiling, but FFmpeg
+# configure only knows "darwin" (breaks the x86_64 half of --universal on arm64).
+[patch.crates-io]
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
