@@ -1,4 +1,5 @@
 use crate::modules::param::Param;
+use crate::modules::signal::Signal;
 use crate::ModuleChrome;
 use serde::{Deserialize, Serialize};
 
@@ -27,14 +28,15 @@ impl LagMode {
 
 /// LAG: follows its number input slowly, smoothing out jumps (an LFO's
 /// square wave, a random step, a twitchy pot). It has state, so it's
-/// advanced once per tick by `step` rather than evaluated on demand.
+/// advanced once per tick by `step` rather than evaluated on demand. Fed an
+/// array, it smooths every element on its own.
 pub struct LagState {
     pub chrome: ModuleChrome,
     /// Seconds to catch up.
     pub time: Param,
     pub mode: LagMode,
     pub dropdown_open: bool,
-    current: Option<f32>,
+    current: Option<Signal>,
 }
 
 impl LagState {
@@ -48,32 +50,38 @@ impl LagState {
         }
     }
 
-    /// The smoothed value, once an input has been seen.
-    pub fn output(&self) -> Option<f32> {
-        self.current
+    /// The smoothed value (or values), once an input has been seen.
+    pub fn output(&self) -> Option<Signal> {
+        self.current.clone()
     }
 
     /// Moves `dt` seconds towards `target`; no input (`None`) forgets the
-    /// state so the next input is picked up immediately.
-    pub fn step(&mut self, target: Option<f32>, dt: f32) {
+    /// state so the next input is picked up immediately, as does a change
+    /// between a single value and an array (or in the array's length).
+    pub fn step(&mut self, target: Option<Signal>, dt: f32) {
         let Some(target) = target else {
             self.current = None;
             return;
         };
-        let current = self.current.unwrap_or(target);
-        let time = self.time.value.max(0.0);
-        let next = if time <= f32::EPSILON {
-            target
-        } else {
-            match self.mode {
-                LagMode::Smooth => current + (target - current) * (1.0 - (-dt / time).exp()),
-                LagMode::Linear => {
-                    let max_step = dt / time;
-                    current + (target - current).clamp(-max_step, max_step)
-                }
-            }
+        let current = match self.current.take() {
+            Some(c) if c.is_many() == target.is_many() && c.values().len() == target.values().len() => c,
+            _ => target.clone(),
         };
-        self.current = Some(next);
+        self.current = Some(current.zip_with(&target, |c, t| self.follow(c, t, dt)));
+    }
+
+    fn follow(&self, current: f32, target: f32, dt: f32) -> f32 {
+        let time = self.time.value.max(0.0);
+        if time <= f32::EPSILON {
+            return target;
+        }
+        match self.mode {
+            LagMode::Smooth => current + (target - current) * (1.0 - (-dt / time).exp()),
+            LagMode::Linear => {
+                let max_step = dt / time;
+                current + (target - current).clamp(-max_step, max_step)
+            }
+        }
     }
 }
 
@@ -84,11 +92,11 @@ mod tests {
     fn run(mode: LagMode, steps: usize) -> Vec<f32> {
         let mut lag = LagState::new();
         lag.mode = mode;
-        lag.step(Some(0.0), 0.0);
+        lag.step(Some(Signal::One(0.0)), 0.0);
         (0..steps)
             .map(|_| {
-                lag.step(Some(1.0), 1.0 / 60.0);
-                lag.output().unwrap()
+                lag.step(Some(Signal::One(1.0)), 1.0 / 60.0);
+                lag.output().unwrap().as_one().unwrap()
             })
             .collect()
     }
@@ -96,8 +104,8 @@ mod tests {
     #[test]
     fn first_input_is_taken_as_is() {
         let mut lag = LagState::new();
-        lag.step(Some(0.7), 0.016);
-        assert_eq!(lag.output(), Some(0.7));
+        lag.step(Some(Signal::One(0.7)), 0.016);
+        assert_eq!(lag.output(), Some(Signal::One(0.7)));
     }
 
     #[test]
@@ -119,10 +127,22 @@ mod tests {
     fn zero_time_is_instant_and_no_input_resets() {
         let mut lag = LagState::new();
         lag.time.set(0.0);
-        lag.step(Some(0.2), 0.016);
-        lag.step(Some(0.9), 0.016);
-        assert_eq!(lag.output(), Some(0.9));
+        lag.step(Some(Signal::One(0.2)), 0.016);
+        lag.step(Some(Signal::One(0.9)), 0.016);
+        assert_eq!(lag.output(), Some(Signal::One(0.9)));
         lag.step(None, 0.016);
         assert_eq!(lag.output(), None);
+    }
+
+    #[test]
+    fn arrays_are_smoothed_element_by_element() {
+        let mut lag = LagState::new();
+        lag.mode = LagMode::Linear;
+        lag.step(Some(Signal::Many(vec![0.0, 1.0])), 0.0);
+        lag.step(Some(Signal::Many(vec![1.0, 1.0])), 0.25);
+        assert_eq!(lag.output(), Some(Signal::Many(vec![0.5, 1.0])));
+        // A different length starts over from the new input.
+        lag.step(Some(Signal::Many(vec![0.3])), 0.25);
+        assert_eq!(lag.output(), Some(Signal::Many(vec![0.3])));
     }
 }

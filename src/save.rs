@@ -5,6 +5,7 @@ use crate::modules::math::{
     lfo::{LfoState, Wave},
     mult::MultState,
     number::NumberState,
+    select::SelectState,
 };
 use crate::modules::mix::blend::{BlendMode, BlendState};
 use crate::modules::param::Param;
@@ -13,7 +14,7 @@ use crate::modules::sources::camera::CameraState;
 use crate::modules::sources::video::{LoopMode, VideoState};
 use crate::modules::sources::wled::WledState;
 use crate::modules::math::osc::OscState;
-use crate::modules::{Connection, ModuleBody, ModuleKind, PlacedModule};
+use crate::modules::{drop_mismatched, Connection, ModuleBody, ModuleKind, PlacedModule};
 use crate::group::Group;
 use crate::{canvas_rect, Model, ModuleChrome, SAVE_PATH};
 use nokhwa::utils::CameraInfo;
@@ -76,11 +77,20 @@ struct SavedModule {
     map_auto: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     map_center: Option<bool>,
-    /// A WLED module's device (address) and the GPIO it outputs.
+    /// A WLED module's device (address), and the GPIO an old composition
+    /// sent out of it (see `split_legacy_wled`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wled_device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wled_pin: Option<u8>,
+    /// A Select's picked elements, its mode, and the GPIO it's still
+    /// waiting to pick (from an old WLED cable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected: Option<Vec<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    combine: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_gpio: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blend_mode: Option<BlendMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,8 +148,15 @@ fn restore_param(saved: Option<SavedParam>, legacy: Option<f32>, default: Param)
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedConnection {
     from: u64,
+    /// Which output of `from` (only a Select has more than one).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    from_output: usize,
     to: u64,
     to_input: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A group frame: its members by module id.
@@ -197,7 +214,7 @@ impl Snippet {
         let mut cables: Vec<String> = self
             .connections
             .iter()
-            .filter_map(|c| Some(format!("{}>{}:{}", signatures.get(&c.from)?, signatures.get(&c.to)?, c.to_input)))
+            .filter_map(|c| Some(format!("{}.{}>{}:{}", signatures.get(&c.from)?, c.from_output, signatures.get(&c.to)?, c.to_input)))
             .collect();
         cables.sort();
         format!("{modules:?}|{cables:?}")
@@ -231,7 +248,7 @@ fn save_group(g: &Group) -> SavedGroup {
 }
 
 fn save_connection(c: &Connection) -> SavedConnection {
-    SavedConnection { from: c.from, to: c.to, to_input: c.to_input }
+    SavedConnection { from: c.from, from_output: c.from_output, to: c.to, to_input: c.to_input }
 }
 
 /// The modules `ids` (Output excluded: there's only ever one), the cables
@@ -273,9 +290,11 @@ pub fn paste(model: &mut Model, snippet: &Snippet, center: Point2) -> Vec<u64> {
     }
     for c in &snippet.connections {
         if let (Some(&from), Some(&to)) = (new_ids.get(&c.from), new_ids.get(&c.to)) {
-            model.connections.push(Connection { from, to, to_input: c.to_input });
+            model.connections.push(Connection { from, from_output: c.from_output, to, to_input: c.to_input });
         }
     }
+    let pasted: Vec<u64> = new_ids.values().copied().collect();
+    split_legacy_wled(&mut model.modules, &mut model.connections, &mut model.next_id, &pasted);
     for g in &snippet.groups {
         let members: Vec<u64> = g.members.iter().filter_map(|id| new_ids.get(id).copied()).collect();
         model.add_group(g.title.clone(), members, g.collapsed);
@@ -300,6 +319,7 @@ fn save_module(m: &PlacedModule) -> SavedModule {
     let (mut video_path, mut video_loop, mut playing, mut position) = (None, None, None, None);
     let (mut fields, mut clamp, mut wled_device, mut wled_pin) = (None, None, None, None);
     let (mut map_auto, mut map_center) = (None, None);
+    let (mut selected, mut combine, mut pending_gpio) = (None, None, None);
     match &m.body {
         ModuleBody::Camera(cam) => {
             camera_name = cam.wanted.clone();
@@ -354,6 +374,11 @@ fn save_module(m: &PlacedModule) -> SavedModule {
             param = Some(lag.time.into());
             lag_mode = Some(lag.mode);
         }
+        ModuleBody::Select(select) => {
+            selected = Some(select.selected.clone());
+            combine = Some(select.combine);
+            pending_gpio = select.pending_gpio;
+        }
         ModuleBody::Output(_) | ModuleBody::Mult(_) => {}
     };
     SavedModule {
@@ -381,6 +406,9 @@ fn save_module(m: &PlacedModule) -> SavedModule {
         map_center,
         wled_device,
         wled_pin,
+        selected,
+        combine,
+        pending_gpio,
         blend_mode,
         lag_mode,
         shader_params,
@@ -526,6 +554,14 @@ fn restore_body(saved: SavedModule, cameras: &[CameraInfo]) -> ModuleBody {
             lag.mode = saved.lag_mode.unwrap_or_default();
             ModuleBody::Lag(lag)
         }
+        ModuleKind::Select => {
+            let mut select = SelectState::new();
+            select.chrome = chrome;
+            select.selected = saved.selected.unwrap_or_default();
+            select.combine = saved.combine.unwrap_or(false);
+            select.pending_gpio = saved.pending_gpio;
+            ModuleBody::Select(select)
+        }
         ModuleKind::Mult => {
             let mut mult = MultState::new();
             mult.chrome = chrome;
@@ -584,14 +620,18 @@ fn finish_load(
         });
     }
 
-    let connections = connections
+    let mut connections = connections
         .into_iter()
         .map(|c| Connection {
             from: c.from,
+            from_output: c.from_output,
             to: c.to,
             to_input: c.to_input,
         })
         .collect();
+    let all: Vec<u64> = modules.iter().map(|m| m.id).collect();
+    split_legacy_wled(&mut modules, &mut connections, &mut next_id, &all);
+    drop_mismatched(&modules, &mut connections);
 
     model.modules = modules;
     model.connections = connections;
@@ -605,6 +645,40 @@ fn finish_load(
     }
 }
 
+/// WLED used to send out one input (the GPIO picked on the module); now it
+/// sends them all as an array. Each old WLED among `ids` that feeds
+/// anything gets a Select in between, waiting to pick that GPIO once the
+/// device reports it (see `SelectState::pending_gpio`).
+fn split_legacy_wled(modules: &mut Vec<PlacedModule>, connections: &mut Vec<Connection>, next_id: &mut u64, ids: &[u64]) {
+    for i in 0..modules.len() {
+        let (id, pos) = (modules[i].id, modules[i].pos);
+        if !ids.contains(&id) {
+            continue;
+        }
+        let ModuleBody::Wled(w) = &mut modules[i].body else { continue };
+        let Some(pin) = w.pin.take() else { continue };
+        // Everything it fed got that one value: it now comes from the Select.
+        let plain: Vec<usize> = (0..connections.len()).filter(|&n| connections[n].from == id).collect();
+        if plain.is_empty() {
+            continue;
+        }
+        let select_id = *next_id;
+        *next_id += 1;
+        let mut select = SelectState::new();
+        select.pending_gpio = Some(pin);
+        modules.push(PlacedModule {
+            id: select_id,
+            kind: ModuleKind::Select,
+            pos: pos + vec2(250.0, 0.0),
+            body: ModuleBody::Select(select),
+        });
+        for n in plain {
+            connections[n].from = select_id;
+            connections[n].from_output = 0;
+        }
+        connections.push(Connection { from: id, from_output: 0, to: select_id, to_input: 0 });
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -658,6 +732,31 @@ mod tests {
         assert!(map.clamp);
         assert_eq!(map.apply(0.5), 0.5);
         assert_eq!(map.apply(5.0), 0.8);
+    }
+
+    #[test]
+    fn old_wled_cable_gets_a_select_waiting_for_its_gpio() {
+        let saved = |json: &str| restore_body(serde_json::from_str(json).unwrap(), &[]);
+        let wled = saved(r#"{"id":1,"kind":"wled","pos":[0,0],"minimized":false,"show_preview":false,"wled_pin":32}"#);
+        let blend = saved(r#"{"id":2,"kind":"blend","pos":[300,0],"minimized":false,"show_preview":false}"#);
+        let lag = saved(r#"{"id":3,"kind":"lag","pos":[300,0],"minimized":false,"show_preview":false}"#);
+        let mut modules = vec![
+            PlacedModule { id: 1, kind: ModuleKind::Wled, pos: pt2(0.0, 0.0), body: wled },
+            PlacedModule { id: 2, kind: ModuleKind::Blend, pos: pt2(300.0, 0.0), body: blend },
+            PlacedModule { id: 3, kind: ModuleKind::Lag, pos: pt2(300.0, 0.0), body: lag },
+        ];
+        let mut connections = vec![
+            Connection { from: 1, from_output: 0, to: 2, to_input: 2 },
+            Connection { from: 1, from_output: 0, to: 3, to_input: 0 },
+        ];
+        let mut next_id = 4;
+        split_legacy_wled(&mut modules, &mut connections, &mut next_id, &[1, 2, 3]);
+        let ModuleBody::Select(select) = &modules[3].body else { panic!("no Select") };
+        assert_eq!(select.pending_gpio, Some(32));
+        // Both kept getting the one value they did before.
+        assert_eq!(connections[0], Connection { from: 4, from_output: 0, to: 2, to_input: 2 });
+        assert_eq!(connections[1], Connection { from: 4, from_output: 0, to: 3, to_input: 0 });
+        assert_eq!(connections[2], Connection { from: 1, from_output: 0, to: 4, to_input: 0 });
     }
 
     #[test]

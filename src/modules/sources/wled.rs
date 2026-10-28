@@ -12,6 +12,9 @@ use wled_pots::{DeviceReading, Pin};
 /// Analog readings are 12-bit on an ESP32; an ESP8266 tops out at 1023
 /// (set the box's Raw max to that).
 pub const RAW_MAX: f32 = 4095.0;
+/// Room for the status text inside its box, and its font size.
+pub const STATUS_W: f32 = 168.0;
+pub const STATUS_FONT: u32 = 11;
 /// An analog input that moved within this long shows as active.
 const ACTIVITY: Duration = Duration::from_millis(350);
 
@@ -83,6 +86,11 @@ pub struct InputView {
     pub active: bool,
 }
 
+/// "32 · Analog". A Select finds an old composition's GPIO by this prefix.
+pub fn input_label(gpio: u8, kind: &str) -> String {
+    format!("{gpio} \u{00B7} {kind}")
+}
+
 /// The pins worth showing: buttons/switches and anything with a live reading.
 fn is_input(pin: &Pin) -> bool {
     pin.raw.is_some() || pin.button_type.is_some_and(|t| t >= 2)
@@ -91,13 +99,18 @@ fn is_input(pin: &Pin) -> bool {
 pub struct WledState {
     pub chrome: ModuleChrome,
     pub device: Option<SocketAddr>,
-    /// The GPIO whose value goes out of the module.
+    /// The GPIO an old composition sent out of the module (before WLED
+    /// sent every input as an array): loading turns it into a Select.
     pub pin: Option<u8>,
     /// Full scale of analog readings.
     pub raw_max: Param,
     pub dropdown_open: bool,
     pub inputs: Vec<InputView>,
     pub link: Option<Link>,
+    /// The status line (connection state or error), wrapped to fit the box;
+    /// re-wrapped only when the text changes.
+    pub status: Vec<String>,
+    status_text: String,
     /// When each GPIO's value last moved, for the activity lights.
     changed: Vec<(u8, f32, Instant)>,
 }
@@ -112,18 +125,41 @@ impl WledState {
             dropdown_open: false,
             inputs: Vec::new(),
             link: None,
+            status: vec![String::new()],
+            status_text: String::new(),
             changed: Vec::new(),
         }
     }
 
-    /// The selected input's value, if the device has reported it.
-    pub fn output(&self) -> Option<f32> {
-        let pin = self.pin?;
-        self.inputs.iter().find(|i| i.gpio == pin).map(|i| i.value)
+    /// Every input's value, in the device's pin order.
+    pub fn output(&self) -> Vec<f32> {
+        self.inputs.iter().map(|i| i.value).collect()
+    }
+
+    /// What a Select downstream calls each element.
+    pub fn labels(&self) -> Vec<String> {
+        self.inputs.iter().map(|i| input_label(i.gpio, i.kind)).collect()
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self.link, Some(Link::Error(_)))
     }
 
     /// Takes in the device's latest reading (`None`: no device / not tracked).
     pub fn refresh(&mut self, reading: Option<&DeviceReading>, poll: Duration) {
+        self.read(reading, poll);
+        let text = match (&self.link, self.device) {
+            (Some(link), _) => link.text(),
+            (None, Some(_)) => "not tracked (see the WLED panel)".into(),
+            (None, None) => "no controller".into(),
+        };
+        if text != self.status_text {
+            self.status = crate::ui::wrap(&text, STATUS_W, STATUS_FONT);
+            self.status_text = text;
+        }
+    }
+
+    fn read(&mut self, reading: Option<&DeviceReading>, poll: Duration) {
         let Some(reading) = reading else {
             self.inputs.clear();
             self.link = None;
@@ -161,15 +197,6 @@ impl WledState {
                 }
             })
             .collect();
-        // First reading: pick the first pot (or any input) automatically.
-        if self.pin.is_none() {
-            self.pin = self
-                .inputs
-                .iter()
-                .find(|i| i.kind.starts_with("Analog"))
-                .or(self.inputs.first())
-                .map(|i| i.gpio);
-        }
     }
 }
 
@@ -193,12 +220,14 @@ mod tests {
     ]}"#;
 
     #[test]
-    fn reads_inputs_and_picks_the_first_pot() {
+    fn reads_every_input_as_an_array() {
         let mut w = WledState::new();
         w.refresh(Some(&reading(PINS)), Duration::from_millis(50));
         assert_eq!(w.inputs.len(), 3, "the LED pin isn't an input");
-        assert_eq!(w.pin, Some(32));
-        assert!((w.output().unwrap() - 0.5).abs() < 0.01);
+        let out = w.output();
+        assert_eq!(out.len(), 3);
+        assert!((out[1] - 0.5).abs() < 0.01);
+        assert_eq!(w.labels()[1], "32 \u{00B7} Analog");
         let button = w.inputs.iter().find(|i| i.gpio == 0).unwrap();
         assert_eq!((button.value, button.active), (1.0, true));
         let inverted = w.inputs.iter().find(|i| i.gpio == 33).unwrap();
@@ -211,7 +240,7 @@ mod tests {
         let mut w = WledState::new();
         w.raw_max.set(1023.0);
         w.refresh(Some(&reading(PINS)), Duration::from_millis(50));
-        assert_eq!(w.output(), Some(1.0)); // 2048 is past a 10-bit full scale
+        assert_eq!(w.output()[1], 1.0); // 2048 is past a 10-bit full scale
     }
 
     #[test]

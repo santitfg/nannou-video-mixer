@@ -18,12 +18,13 @@ use modules::param::Param;
 use modules::sources::camera::{discover_cameras, CameraWatcher, CameraWorker};
 use modules::sources::video::{fmt_time, LoopMode, VideoState, VideoWorker};
 use modules::sources::wled::{short_name, Link, WledState};
-use modules::{multi_input, WLED_ROWS_TOP, WLED_ROW_H};
+use modules::{multi_input, wled_rows_top, Signal, SELECT_ROWS_TOP, SELECT_ROW_H, WLED_ROW_H, WLED_STATUS_LINE_H};
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use wled_pots::{DeviceDiscovery, DiscoveredDevice, MdnsDiscovery, WledManager};
 use modules::{
-    has_config_row, has_output, input_source, kind_label, module_number, output_type,
+    drop_mismatched, has_config_row, has_output, input_number, input_port, input_signal, input_source, kind_label,
+    module_number, module_signal, output_type, select_input, signal_labels, signal_type,
     push_module as modules_push_module, reaches, title_buttons_for, Connection, ModuleBody,
     ModuleKind, PlacedModule, PortType, TitleButton, CATEGORIES, SHADER_PORT_STEP, SHADER_PORT_TOP,
 };
@@ -242,7 +243,8 @@ impl TextEdit {
 enum Drag {
     /// `start` is where the module sat when grabbed (to tell a click from a drag).
     Module { id: u64, offset: Vec2, start: Point2 },
-    Cable { from: u64 },
+    /// A cable leaving output `output` of module `from`.
+    Cable { from: u64, output: usize },
     /// Drag-to-adjust on a number box. `last_x` is the previous world x;
     /// `moved` the total screen distance, to tell a click from a drag.
     Param { target: ParamTarget, last_x: f32, moved: f32 },
@@ -713,6 +715,7 @@ fn update(app: &App, model: &mut Model, update: Update) {
     }
     step_lags(app, model, update.since_last.as_secs_f32());
     step_maps(app, model);
+    step_selects(app, model);
     step_videos(app, model, update.since_last.as_secs_f64());
     step_wled(model);
     step_osc(model);
@@ -834,10 +837,7 @@ fn step_videos(app: &App, model: &mut Model, dt: f64) {
         .enumerate()
         .filter_map(|(i, m)| {
             let ModuleBody::Video(video) = &m.body else { return None };
-            let signal = |input: usize| {
-                input_source(&model.connections, m.id, input)
-                    .and_then(|src| module_number(&model.modules, &model.connections, src, app.time, &mut vec![m.id]))
-            };
+            let signal = |input: usize| input_number(&model.modules, &model.connections, m.id, input, app.time, &mut vec![m.id]);
             Some((i, video.speed.resolve(signal(0)), signal(1)))
         })
         .collect();
@@ -850,16 +850,12 @@ fn step_videos(app: &App, model: &mut Model, dt: f64) {
 
 /// Lags have state: each one moves towards its input once per tick.
 fn step_lags(app: &App, model: &mut Model, dt: f32) {
-    let targets: Vec<(usize, Option<f32>)> = model
+    let targets: Vec<(usize, Option<Signal>)> = model
         .modules
         .iter()
         .enumerate()
         .filter(|(_, m)| matches!(m.body, ModuleBody::Lag(_)))
-        .map(|(i, m)| {
-            let target = input_source(&model.connections, m.id, 0)
-                .and_then(|src| module_number(&model.modules, &model.connections, src, app.time, &mut vec![m.id]));
-            (i, target)
-        })
+        .map(|(i, m)| (i, input_signal(&model.modules, &model.connections, m.id, 0, app.time, &mut vec![m.id])))
         .collect();
     for (i, target) in targets {
         if let ModuleBody::Lag(lag) = &mut model.modules[i].body {
@@ -870,20 +866,67 @@ fn step_lags(app: &App, model: &mut Model, dt: f32) {
 
 /// Maps in autorange mode learn their From range from their input.
 fn step_maps(app: &App, model: &mut Model) {
-    let inputs: Vec<(usize, Option<f32>)> = model
+    let inputs: Vec<(usize, Option<Signal>)> = model
         .modules
         .iter()
         .enumerate()
         .filter(|(_, m)| matches!(&m.body, ModuleBody::Map(map) if map.auto))
-        .map(|(i, m)| {
-            let input = input_source(&model.connections, m.id, 0)
-                .and_then(|src| module_number(&model.modules, &model.connections, src, app.time, &mut vec![m.id]));
-            (i, input)
-        })
+        .map(|(i, m)| (i, input_signal(&model.modules, &model.connections, m.id, 0, app.time, &mut vec![m.id])))
         .collect();
     for (i, input) in inputs {
         if let ModuleBody::Map(map) = &mut model.modules[i].body {
-            map.learn(input);
+            map.learn(input.as_ref().map_or(&[], |s| s.values()));
+        }
+    }
+}
+
+/// Selects keep a copy of their input (and what each element is called)
+/// for drawing their rows; one loaded from an old composition picks its
+/// GPIO here once the WLED reports it.
+fn step_selects(app: &App, model: &mut Model) {
+    let fresh: Vec<(usize, Vec<f32>, Vec<String>)> = model
+        .modules
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.body, ModuleBody::Select(_)))
+        .map(|(i, m)| {
+            let (modules, connections) = (&model.modules, &model.connections);
+            let values = select_input(modules, connections, m.id, app.time, &mut vec![m.id]);
+            let labels = multi_input::source_ports(connections, m.id, 0)
+                .into_iter()
+                .flat_map(|(from, out)| {
+                    let len = module_signal(modules, connections, from, out, app.time, &mut vec![m.id]).map_or(0, |s| s.values().len());
+                    signal_labels(modules, connections, from, out, len, &mut vec![m.id])
+                })
+                .collect();
+            (i, values, labels)
+        })
+        .collect();
+    for (i, values, labels) in fresh {
+        let id = model.modules[i].id;
+        let ModuleBody::Select(select) = &mut model.modules[i].body else { continue };
+        select.values = values;
+        select.labels = labels;
+        let Some(gpio) = select.pending_gpio else { continue };
+        let prefix = format!("{gpio} \u{00B7}");
+        if let Some(e) = select.labels.iter().position(|l| l.starts_with(&prefix)) {
+            select.pending_gpio = None;
+            select.selected = vec![false; e + 1];
+            select.selected[e] = true;
+            for c in model.connections.iter_mut().filter(|c| c.from == id) {
+                c.from_output = e;
+            }
+        }
+    }
+}
+
+/// A number or an array, for readouts: an array shows its length and first values.
+fn fmt_signal(signal: &Signal) -> String {
+    match signal {
+        Signal::One(x) => fmt_num(*x),
+        Signal::Many(v) => {
+            let first: Vec<String> = v.iter().take(2).map(|x| fmt_num(*x)).collect();
+            format!("[{}] {}{}", v.len(), first.join(" "), if v.len() > 2 { "\u{2026}" } else { "" })
         }
     }
 }
@@ -1307,8 +1350,7 @@ fn param_input(module: &PlacedModule, slot: Slot) -> Option<usize> {
 /// The signal wired into a number box right now, if anything is.
 fn param_signal(model: &Model, module: &PlacedModule, slot: Slot, now: f32) -> Option<f32> {
     let input = param_input(module, slot)?;
-    let src = input_source(&model.connections, module.id, input)?;
-    module_number(&model.modules, &model.connections, src, now, &mut vec![module.id])
+    input_number(&model.modules, &model.connections, module.id, input, now, &mut vec![module.id])
 }
 
 /// Everything needed to draw a number box.
@@ -1335,7 +1377,7 @@ fn param_view(model: &Model, module: &PlacedModule, slot: Slot, now: f32) -> Opt
             format!("{} Hz \u{2192} {}", fmt_num(shown), fmt_num(out))
         }
         (ModuleBody::Lag(lag), _) => {
-            let out = lag.output().map_or("\u{2014}".to_string(), fmt_num);
+            let out = lag.output().map_or("\u{2014}".to_string(), |s| fmt_signal(&s));
             format!("{} s \u{2192} {out}", fmt_num(shown))
         }
         (ModuleBody::Shader(s), Slot::Prop(i)) => {
@@ -1605,9 +1647,9 @@ fn bridge_over(model: &mut Model, id: u64) {
     let Some(signal) = output_type(module.kind) else { return };
     let types = module.input_types();
     let upstream = (0..types.len())
-        .filter(|&n| types[n] == signal)
-        .find_map(|n| multi_input::sources(&model.connections, id, n).first().copied());
-    let Some(upstream) = upstream else { return };
+        .filter(|&n| types[n].accepts(signal))
+        .find_map(|n| multi_input::source_ports(&model.connections, id, n).first().copied());
+    let Some((upstream, upstream_output)) = upstream else { return };
     let downstream: Vec<(u64, usize)> =
         model.connections.iter().filter(|c| c.from == id).map(|c| (c.to, c.to_input)).collect();
     for (to, to_input) in downstream {
@@ -1618,13 +1660,14 @@ fn bridge_over(model: &mut Model, id: u64) {
         // A multi port keeps the order: the bridge takes the deleted cable's place.
         if multi_input::is_multi(kind, to_input) {
             if let Some(pos) = model.connections.iter().position(|c| c.from == id && c.to == to && c.to_input == to_input) {
-                if model.connections.iter().any(|c| c.from == upstream && c.to == to && c.to_input == to_input) {
+                if model.connections.iter().any(|c| c.from == upstream && c.from_output == upstream_output && c.to == to && c.to_input == to_input) {
                     continue;
                 }
                 model.connections[pos].from = upstream;
+                model.connections[pos].from_output = upstream_output;
             }
         } else {
-            multi_input::connect(&mut model.connections, kind, upstream, to, to_input);
+            multi_input::connect(&mut model.connections, kind, upstream, upstream_output, to, to_input);
         }
     }
 }
@@ -1642,6 +1685,8 @@ fn delete_modules(model: &mut Model, ids: &[u64]) {
         model.connections.retain(|c| c.from != id && c.to != id);
     }
     model.modules.retain(|m| !doomed.contains(&m.id));
+    // A bridged array may have landed on a plain number input.
+    drop_mismatched(&model.modules, &mut model.connections);
     for g in &mut model.groups {
         g.members.retain(|id| !doomed.contains(id));
     }
@@ -2536,8 +2581,9 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
 
         if let (Some(button), false, true) = (map_button_at(body, mouse), minimized, matches!(model.modules[i].body, ModuleBody::Map(_))) {
             let id = model.modules[i].id;
-            let input = input_source(&model.connections, id, 0)
-                .and_then(|src| module_number(&model.modules, &model.connections, src, now, &mut vec![id]));
+            // An array calibrates on its average: they share one bias.
+            let input = input_signal(&model.modules, &model.connections, id, 0, now, &mut vec![id])
+                .map(|s| s.values().iter().sum::<f32>() / s.values().len().max(1) as f32);
             if let ModuleBody::Map(map) = &mut model.modules[i].body {
                 match button {
                     0 => {
@@ -2566,9 +2612,23 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
                 }
                 return;
             }
-            if let ModuleBody::Wled(w) = &mut model.modules[i].body {
-                if let Some(row) = (0..w.inputs.len()).find(|&r| wled_input_rect(body, r).contains(mouse)) {
-                    w.pin = Some(w.inputs[row].gpio);
+        }
+        if !minimized && output_at(&model.modules[i], mouse).is_none() {
+            if let ModuleBody::Select(select) = &mut model.modules[i].body {
+                if let Some(k) = (0..2).find(|&k| select_mode_rect(body, k).contains(mouse)) {
+                    // Switching mode changes what the outputs carry: their cables go.
+                    if select.combine != (k == 1) {
+                        select.combine = k == 1;
+                        model.connections.retain(|c| c.from != id);
+                    }
+                    return;
+                }
+                if let Some(e) = (0..select.values.len()).find(|&e| select_row_rect(body, e).contains(mouse)) {
+                    select.toggle(e);
+                    // An element that's no longer picked has no port to hold a cable.
+                    if !select.combine && !select.is_selected(e) {
+                        model.connections.retain(|c| !(c.from == id && c.from_output == e));
+                    }
                     return;
                 }
             }
@@ -2618,8 +2678,8 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             return;
         }
 
-        if has_output(kind) && mouse.distance(module_output_port(body)) <= PORT_HIT_RADIUS {
-            model.dragging = Some(Drag::Cable { from: id });
+        if let Some(output) = output_at(&model.modules[i], mouse) {
+            model.dragging = Some(Drag::Cable { from: id, output });
             return;
         }
 
@@ -2635,8 +2695,8 @@ fn handle_press_config(model: &mut Model, win: Rect, screen_mouse: Point2, shift
             // Pick up whatever's already plugged in here, if anything,
             // so it can be moved to a different input or unplugged.
             if let Some(pos) = model.connections.iter().rposition(|c| c.to == id && c.to_input == input_index) {
-                let from = model.connections.remove(pos).from;
-                model.dragging = Some(Drag::Cable { from });
+                let c = model.connections.remove(pos);
+                model.dragging = Some(Drag::Cable { from: c.from, output: c.from_output });
             }
             return;
         }
@@ -2791,11 +2851,11 @@ fn handle_release(app: &App, model: &mut Model) {
         _ => {}
     }
     let drag = model.dragging.take();
-    let Some(Drag::Cable { from }) = drag else {
+    let Some(Drag::Cable { from, output }) = drag else {
         return;
     };
 
-    let Some(from_type) = model.modules.iter().find(|m| m.id == from).and_then(|m| output_type(m.kind)) else {
+    let Some(from_type) = port_signal(model, from, output) else {
         return;
     };
 
@@ -2806,10 +2866,11 @@ fn handle_release(app: &App, model: &mut Model) {
         let types = module.input_types();
         let body = module_body_rect(module);
         for (input_index, port_type) in types.iter().enumerate() {
-            // A cable can only land on an input of the same signal type —
-            // dropping a video cable on a number input (or vice versa)
-            // just fails to connect, same as dropping on empty space.
-            if *port_type != from_type {
+            // A cable can only land on an input that takes its signal —
+            // dropping a video cable on a number input (or an array on a
+            // plain number input) just fails to connect, same as dropping
+            // on empty space.
+            if !port_type.accepts(from_type) {
                 continue;
             }
             if port_hit(module, body, input_index, types.len(), mouse) {
@@ -2825,7 +2886,7 @@ fn handle_release(app: &App, model: &mut Model) {
     // Dropped on another cable of the same signal type: it takes that
     // cable's place on the input it feeds.
     if target.is_none() {
-        if let Some(i) = cable_drop_target(model, from, mouse) {
+        if let Some(i) = cable_drop_target(model, from, output, mouse) {
             let c = model.connections.remove(i);
             target = Some((c.to, c.to_input));
         }
@@ -2833,7 +2894,10 @@ fn handle_release(app: &App, model: &mut Model) {
 
     if let Some((to, to_input)) = target {
         if let Some(kind) = model.modules.iter().find(|m| m.id == to).map(|m| m.kind) {
-            multi_input::connect(&mut model.connections, kind, from, to, to_input);
+            multi_input::connect(&mut model.connections, kind, from, output, to, to_input);
+            // A math module that now gets an array sends one on: whatever
+            // plain number input it fed can't take it any more.
+            drop_mismatched(&model.modules, &mut model.connections);
         }
     }
     // Dropped in empty space (or on a mismatched port type): stays
@@ -2886,7 +2950,11 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
                 ModuleBody::Camera(_) => config_rect(body).contains(world),
                 ModuleBody::Shader(sh) => (sh.file.is_none() || !sh.single_choice) && config_rect(body).contains(world),
                 ModuleBody::Lfo(_) => mode_rect(module.kind, body).contains(world) || lfo_center_rect(body).contains(world),
-                ModuleBody::Wled(w) => config_rect(body).contains(world) || (0..w.inputs.len()).any(|r| wled_input_rect(body, r).contains(world)),
+                ModuleBody::Wled(_) => config_rect(body).contains(world),
+                ModuleBody::Select(s) => {
+                    (0..2).any(|k| select_mode_rect(body, k).contains(world))
+                        || (0..s.values.len()).any(|e| select_row_rect(body, e).contains(world))
+                }
                 ModuleBody::Map(_) => map_button_at(body, world).is_some(),
                 ModuleBody::Video(_) => [config_rect(body), video_play_rect(body), video_loop_rect(body), video_scrub_rect(body).pad(-4.0)]
                     .iter()
@@ -2895,7 +2963,7 @@ fn cursor_for(app: &App, model: &Model) -> CursorIcon {
                 _ => false,
             };
         let inputs = module.input_types().len();
-        let on_port = (has_output(module.kind) && world.distance(module_output_port(body)) <= PORT_HIT_RADIUS)
+        let on_port = output_at(module, world).is_some()
             || (0..inputs).any(|n| port_hit(module, body, n, inputs, world));
         if on_title_button || on_selector || on_port {
             return CursorIcon::Hand;
@@ -3234,7 +3302,7 @@ fn dropdown_anchor(module: &PlacedModule) -> Rect {
 /// WLED's Raw max sits under its input rows.
 fn field_rect(module: &PlacedModule, body: Rect, i: usize) -> Rect {
     if let ModuleBody::Wled(w) = &module.body {
-        return wled_raw_max_rect(body, w.inputs.len());
+        return wled_raw_max_rect(body, wled_rows_top(w), w.inputs.len());
     }
     let row = config_rect(body).shift_y(-36.0 * (i / 2) as f32);
     let half = (row.w() - 6.0) / 2.0;
@@ -3275,17 +3343,33 @@ fn math_readout_rect(module: &PlacedModule, body: Rect) -> Rect {
     }
 }
 
-fn wled_status_rect(body: Rect) -> Rect {
-    Rect::from_x_y_w_h(body.x(), body.top() - 80.0, body.w() - 24.0, 16.0)
+/// The status box under the selector: as tall as its wrapped text.
+fn wled_status_rect(body: Rect, lines: usize) -> Rect {
+    let h = lines.max(1) as f32 * WLED_STATUS_LINE_H + 6.0;
+    Rect::from_x_y_w_h(body.x(), body.top() - 71.0 - h / 2.0, body.w() - 24.0, h)
 }
 
-fn wled_input_rect(body: Rect, i: usize) -> Rect {
-    let y = body.top() - WLED_ROWS_TOP - (i as f32 + 0.5) * WLED_ROW_H;
+/// Input row `i`; `top` is where the rows start (see `wled_rows_top`).
+fn wled_input_rect(body: Rect, top: f32, i: usize) -> Rect {
+    let y = body.top() - top - (i as f32 + 0.5) * WLED_ROW_H;
     Rect::from_x_y_w_h(body.x(), y, body.w() - 24.0, WLED_ROW_H - 4.0)
 }
 
-fn wled_raw_max_rect(body: Rect, inputs: usize) -> Rect {
-    let y = body.top() - WLED_ROWS_TOP - inputs.max(1) as f32 * WLED_ROW_H - 18.0;
+/// Select's mode pills (Split, Combine), clear of its input pill.
+fn select_mode_rect(body: Rect, k: usize) -> Rect {
+    let row = config_rect(body).pad_left(14.0);
+    let w = (row.w() - 6.0) / 2.0;
+    Rect::from_x_y_w_h(row.left() + w / 2.0 + k as f32 * (w + 6.0), row.y(), w, row.h() - 6.0)
+}
+
+/// One of Select's element rows; a picked one has its port at the row's right end.
+fn select_row_rect(body: Rect, i: usize) -> Rect {
+    let y = body.top() - SELECT_ROWS_TOP - (i as f32 + 0.5) * SELECT_ROW_H;
+    Rect::from_x_y_w_h(body.x() + 6.0, y, body.w() - 36.0, SELECT_ROW_H - 4.0)
+}
+
+fn wled_raw_max_rect(body: Rect, top: f32, inputs: usize) -> Rect {
+    let y = body.top() - top - inputs.max(1) as f32 * WLED_ROW_H - 18.0;
     Rect::from_x_y_w_h(body.x(), y, body.w() - 24.0, 22.0)
 }
 
@@ -3591,6 +3675,45 @@ fn module_output_port(body: Rect) -> Point2 {
     pt2(body.right(), body.y())
 }
 
+/// The output ports a module shows, by output number: one for most, one
+/// per picked element on a Select that splits (each at its row).
+fn output_ports(module: &PlacedModule) -> Vec<(usize, Point2)> {
+    if !has_output(module.kind) {
+        return Vec::new();
+    }
+    let body = module_body_rect(module);
+    match &module.body {
+        ModuleBody::Select(select) if !select.combine => {
+            let minimized = is_minimized_body(body);
+            select
+                .output_elements()
+                .into_iter()
+                .map(|e| (e, if minimized { module_output_port(body) } else { pt2(body.right(), select_row_rect(body, e).y()) }))
+                .collect()
+        }
+        _ => vec![(0, module_output_port(body))],
+    }
+}
+
+/// Where output `output` leaves the module (a cable from an output that
+/// isn't showing, like an element no longer there, leaves from the middle).
+fn output_port_pos(module: &PlacedModule, output: usize) -> Point2 {
+    output_ports(module)
+        .into_iter()
+        .find(|(o, _)| *o == output)
+        .map_or_else(|| module_output_port(module_body_rect(module)), |(_, p)| p)
+}
+
+/// The output port under `p`, if any.
+fn output_at(module: &PlacedModule, p: Point2) -> Option<usize> {
+    output_ports(module).into_iter().find(|(_, pos)| p.distance(*pos) <= PORT_HIT_RADIUS).map(|(o, _)| o)
+}
+
+/// What output `output` of `id` carries right now (see `modules::signal_type`).
+fn port_signal(model: &Model, id: u64, output: usize) -> Option<PortType> {
+    signal_type(&model.modules, &model.connections, id, output, &mut Vec::new())
+}
+
 /// Whether a body rect is a minimized module's (with or without preview).
 fn is_minimized_body(body: Rect) -> bool {
     body.h() <= MINIMIZED_H + 0.5 || (body.h() - MINIMIZED_PREVIEW_H).abs() < 0.5
@@ -3655,9 +3778,9 @@ fn port_hit(module: &PlacedModule, body: Rect, index: usize, total: usize, p: Po
     p.distance(module_input_port(module, body, index, total)) <= PORT_HIT_RADIUS
 }
 
-fn draw_pill(draw: &Draw, t: &Theme, body: Rect, layers: usize, hovered: bool) {
+fn draw_pill(draw: &Draw, t: &Theme, body: Rect, port_type: PortType, layers: usize, hovered: bool) {
     let rect = pill_rect(body);
-    let color = t.port(PortType::Video);
+    let color = t.port(port_type);
     ui::rounded(draw, rect, rect.w() / 2.0, t.port_ring);
     ui::rounded_outline(draw, rect, rect.w() / 2.0, color, if hovered { 4.0 } else { 2.5 });
     if layers == 0 {
@@ -3666,9 +3789,12 @@ fn draw_pill(draw: &Draw, t: &Theme, body: Rect, layers: usize, hovered: bool) {
     for k in 0..layers {
         draw.ellipse().xy(pill_slot(body, k, layers)).radius(3.5).color(color);
     }
-    let label = if layers == 0 { "layers".to_string() } else { format!("\u{00D7}{layers}") };
-    let text = Rect::from_corners(pt2(rect.right() + 6.0, rect.y() - 9.0), pt2(rect.right() + 70.0, rect.y() + 9.0));
-    ui::label_left(draw, text, &label, t.title_text, 11);
+    // A number pill (Select's) has its mode pills beside it instead.
+    if port_type == PortType::Video {
+        let label = if layers == 0 { "layers".to_string() } else { format!("\u{00D7}{layers}") };
+        let text = Rect::from_corners(pt2(rect.right() + 6.0, rect.y() - 9.0), pt2(rect.right() + 70.0, rect.y() + 9.0));
+        ui::label_left(draw, text, &label, t.title_text, 11);
+    }
 }
 
 // --- Stack order menu ----------------------------------------------------------
@@ -4095,14 +4221,15 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
                         };
                         ui::pill_sized(draw, t, rect, label, on, hovered(rect), 11);
                     }
-                    let input = input_source(&model.connections, module.id, 0)
-                        .and_then(|src| module_number(&model.modules, &model.connections, src, now, &mut vec![module.id]));
-                    let output = module_number(&model.modules, &model.connections, module.id, now, &mut Vec::new());
-                    let text = match (input, output) {
-                        (Some(i), Some(o)) => format!("{} \u{2192} {}", fmt_num(i), fmt_num(o)),
+                    let input = input_signal(&model.modules, &model.connections, module.id, 0, now, &mut vec![module.id]);
+                    let output = module_signal(&model.modules, &model.connections, module.id, 0, now, &mut Vec::new());
+                    let text = match (&input, &output) {
+                        (Some(i), Some(o)) if o.is_many() => format!("{} \u{2192} {}", i.values().len(), fmt_signal(o)),
+                        (Some(i), Some(o)) => format!("{} \u{2192} {}", fmt_signal(i), fmt_signal(o)),
                         _ => "no input".to_string(),
                     };
-                    let v = ValueBox { norm: output.unwrap_or(0.0).clamp(0.0, 1.0), text: &text, driven: true, hovered: false, editing: None, caret: false };
+                    let first = output.as_ref().and_then(|o| o.values().first().copied());
+                    let v = ValueBox { norm: first.unwrap_or(0.0).clamp(0.0, 1.0), text: &text, driven: true, hovered: false, editing: None, caret: false };
                     ui::value_box(draw, t, math_readout_rect(module, body), v, 12);
                 }
                 ModuleBody::Shader(shader) => {
@@ -4116,14 +4243,16 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
                     }
                 }
                 ModuleBody::Mult(_) => {
-                    let value = module_number(&model.modules, &model.connections, module.id, now, &mut Vec::new());
-                    let text = match value {
-                        Some(v) => format!("= {}", fmt_num(v)),
+                    let value = module_signal(&model.modules, &model.connections, module.id, 0, now, &mut Vec::new());
+                    let text = match &value {
+                        Some(v) => format!("= {}", fmt_signal(v)),
                         None => "= \u{2014}".to_string(),
                     };
-                    let v = ValueBox { norm: value.unwrap_or(0.0), text: &text, driven: true, hovered: false, editing: None, caret: false };
+                    let first = value.as_ref().and_then(|v| v.values().first().copied());
+                    let v = ValueBox { norm: first.unwrap_or(0.0), text: &text, driven: true, hovered: false, editing: None, caret: false };
                     ui::value_box(draw, t, config, v, 13);
                 }
+                ModuleBody::Select(select) => draw_select_controls(draw, t, select, body, &hovered),
                 _ => {}
             }
         }
@@ -4174,22 +4303,29 @@ fn draw_module(draw: &Draw, t: &Theme, model: &Model, module: &PlacedModule, now
         draw_preview(draw, t, preview, chrome.preview_texture.as_ref(), no_signal);
     }
 
-    if let Some(port_type) = output_type(module.kind) {
-        let pos = module_output_port(body);
-        let connected = model.connections.iter().any(|c| c.from == module.id);
-        draw_port(draw, t, pos, port_type, connected, hover.is_some_and(|m| m.distance(pos) <= PORT_HIT_RADIUS));
+    for (output, pos) in output_ports(module) {
+        let Some(port_type) = port_signal(model, module.id, output) else { continue };
+        let connected = model.connections.iter().any(|c| c.from == module.id && c.from_output == output);
+        let mark = if port_type == PortType::Numbers { ArrayMark::Carries } else { ArrayMark::None };
+        draw_port(draw, t, pos, port_type, mark, connected, hover.is_some_and(|m| m.distance(pos) <= PORT_HIT_RADIUS));
     }
 
     let types = module.input_types();
     for (i, port_type) in types.iter().enumerate() {
         let pos = module_input_port(module, body, i, types.len());
-        let connected = model.connections.iter().any(|c| c.to == module.id && c.to_input == i);
+        let source = input_port(&model.connections, module.id, i);
         if multi_input::is_multi(module.kind, i) {
             let layers = multi_input::sources(&model.connections, module.id, i).len();
-            draw_pill(draw, t, body, if chrome.minimized { 0 } else { layers }, hover.is_some_and(|m| pill_rect(body).contains(m)));
+            draw_pill(draw, t, body, *port_type, if chrome.minimized { 0 } else { layers }, hover.is_some_and(|m| pill_rect(body).contains(m)));
             continue;
         }
-        draw_port(draw, t, pos, *port_type, connected, hover.is_some_and(|m| m.distance(pos) <= PORT_HIT_RADIUS));
+        // An input that takes arrays wears a faint ring; a solid one while an array is plugged in.
+        let mark = match (port_type, source) {
+            (PortType::Numbers, Some((from, out))) if port_signal(model, from, out) == Some(PortType::Numbers) => ArrayMark::Carries,
+            (PortType::Numbers, _) => ArrayMark::Accepts,
+            _ => ArrayMark::None,
+        };
+        draw_port(draw, t, pos, *port_type, mark, source.is_some(), hover.is_some_and(|m| m.distance(pos) <= PORT_HIT_RADIUS));
     }
 
     if let (ModuleBody::Shader(shader), false) = (&module.body, chrome.minimized) {
@@ -4222,29 +4358,28 @@ fn draw_wled_controls(draw: &Draw, t: &Theme, model: &Model, w: &WledState, body
     };
     ui::selector(draw, t, config, &label, hovered(config) || w.dropdown_open);
 
-    let status = wled_status_rect(body);
-    let dot = pt2(status.left() + 5.0, status.y());
-    draw.ellipse().xy(dot).radius(4.0).color(link_color(t, w.link.as_ref()));
-    let text = match (&w.link, w.device) {
-        (Some(link), _) => link.text(),
-        (None, Some(_)) => "not tracked (see the WLED panel)".into(),
-        (None, None) => "no controller".into(),
-    };
-    let color = if matches!(w.link, Some(Link::Error(_))) { t.error } else { t.title_text };
-    ui::label_left(draw, status.pad_left(4.0), &text, color, 10);
+    // The status sits on a dark box, wrapped inside it, so a long error
+    // stays readable and never spills out of the module.
+    let status = wled_status_rect(body, w.status.len());
+    ui::rounded(draw, status, ui::RADIUS, rgba8(20, 22, 25, 225));
+    let first_line = status.top() - 3.0 - WLED_STATUS_LINE_H / 2.0;
+    draw.ellipse().xy(pt2(status.left() + 9.0, first_line)).radius(4.0).color(link_color(t, w.link.as_ref()));
+    let color = if w.is_error() { t.error } else { rgba8(235, 236, 238, 255) };
+    for (k, line) in w.status.iter().enumerate() {
+        let y = first_line - k as f32 * WLED_STATUS_LINE_H;
+        let rect = Rect::from_corners(pt2(status.left() + 18.0, y - 7.0), pt2(status.right() - 4.0, y + 7.0));
+        draw.text(line).xy(rect.xy()).wh(rect.wh()).left_justify().no_line_wrap().color(color).font_size(modules::sources::wled::STATUS_FONT);
+    }
 
+    let top = wled_rows_top(w);
     if w.inputs.is_empty() {
-        let row = wled_input_rect(body, 0);
+        let row = wled_input_rect(body, top, 0);
         let hint = if w.link.is_some() { "no inputs configured on the device" } else { "" };
         ui::label_left(draw, row, hint, t.title_text, 10);
     }
     for (i, input) in w.inputs.iter().enumerate() {
-        let row = wled_input_rect(body, i);
-        let selected = w.pin == Some(input.gpio);
-        ui::rounded(draw, row, ui::RADIUS, if selected { rgba8(0, 0, 0, 90) } else if hovered(row) { rgba8(0, 0, 0, 60) } else { rgba8(0, 0, 0, 35) });
-        if selected {
-            ui::rounded_outline(draw, row, ui::RADIUS, t.accent, 1.5);
-        }
+        let row = wled_input_rect(body, top, i);
+        ui::rounded(draw, row, ui::RADIUS, rgba8(0, 0, 0, 35));
         // Activity light: lit while the input moves or is pressed.
         let light = pt2(row.left() + 10.0, row.y());
         if input.active {
@@ -4252,16 +4387,66 @@ fn draw_wled_controls(draw: &Draw, t: &Theme, model: &Model, w: &WledState, body
         }
         draw.ellipse().xy(light).radius(4.0).color(if input.active { t.ok } else { rgba8(0, 0, 0, 120) });
         let name = Rect::from_corners(pt2(row.left() + 18.0, row.bottom()), pt2(row.left() + 108.0, row.top()));
-        ui::label_left(draw, name, &format!("{} \u{00B7} {}", input.gpio, input.kind), t.title_text, 10);
+        ui::label_left(draw, name, &modules::sources::wled::input_label(input.gpio, input.kind), t.title_text, 10);
         let bar = Rect::from_corners(pt2(row.left() + 112.0, row.y() - 3.0), pt2(row.right() - 40.0, row.y() + 3.0));
         ui::rounded(draw, bar, 3.0, rgba8(0, 0, 0, 90));
         let fill_w = bar.w() * input.value.clamp(0.0, 1.0);
         if fill_w >= 1.0 {
             let fill = Rect::from_x_y_w_h(bar.left() + fill_w / 2.0, bar.y(), fill_w, bar.h());
-            ui::rounded(draw, fill, 3.0, if selected { t.accent } else { t.fill_driven });
+            ui::rounded(draw, fill, 3.0, t.accent);
         }
         let raw = Rect::from_corners(pt2(row.right() - 38.0, row.bottom()), row.top_right());
         draw.text(&input.raw.to_string()).xy(raw.xy()).wh(raw.wh()).right_justify().no_line_wrap().color(t.title_text).font_size(10);
+    }
+}
+
+fn draw_select_controls(draw: &Draw, t: &Theme, select: &modules::math::select::SelectState, body: Rect, hovered: &dyn Fn(Rect) -> bool) {
+    for (k, label) in ["Split", "Combine"].iter().enumerate() {
+        let rect = select_mode_rect(body, k);
+        ui::pill_sized(draw, t, rect, label, select.combine == (k == 1), hovered(rect), 12);
+    }
+    if select.values.is_empty() {
+        let hint = if select.pending_gpio.is_some() { "waiting for the device\u{2026}" } else { "plug numbers or an array in" };
+        ui::label_left(draw, select_row_rect(body, 0), hint, t.title_text, 11);
+    }
+    let packing = select.combine && select.selected.iter().all(|x| !x);
+    for (e, value) in select.values.iter().enumerate() {
+        let row = select_row_rect(body, e);
+        let picked = select.is_selected(e);
+        // Picked: tinted with the accent, outlined, a filled mark and bright
+        // text. Not picked: plain, a hollow mark and dimmer text.
+        let fill = if picked {
+            let mut tint = t.accent;
+            tint.alpha = 75;
+            tint
+        } else if hovered(row) {
+            rgba8(0, 0, 0, 70)
+        } else {
+            rgba8(0, 0, 0, 35)
+        };
+        ui::rounded(draw, row, ui::RADIUS, fill);
+        if picked {
+            ui::rounded_outline(draw, row, ui::RADIUS, t.accent, 2.5);
+        }
+        let mark = pt2(row.left() + 11.0, row.y());
+        if picked {
+            draw.ellipse().xy(mark).radius(5.0).color(t.accent).stroke(rgba8(255, 255, 255, 230)).stroke_weight(1.5);
+        } else {
+            draw.ellipse().xy(mark).radius(4.5).no_fill().stroke(rgba8(255, 255, 255, 120)).stroke_weight(1.5);
+        }
+        let text_color = if picked { rgba8(255, 255, 255, 255) } else { rgba8(255, 255, 255, 165) };
+        let label = select.labels.get(e).cloned().unwrap_or_else(|| (e + 1).to_string());
+        let name = Rect::from_corners(pt2(row.left() + 20.0, row.bottom()), pt2(row.left() + 108.0, row.top()));
+        draw.text(&label).xy(name.xy()).wh(name.wh()).left_justify().no_line_wrap().color(text_color).font_size(12);
+        let bar = Rect::from_corners(pt2(row.left() + 110.0, row.y() - 3.0), pt2(row.right() - 36.0, row.y() + 3.0));
+        ui::rounded(draw, bar, 3.0, rgba8(0, 0, 0, 90));
+        let fill_w = bar.w() * value.clamp(0.0, 1.0);
+        if fill_w >= 1.0 {
+            let fill = Rect::from_x_y_w_h(bar.left() + fill_w / 2.0, bar.y(), fill_w, bar.h());
+            ui::rounded(draw, fill, 3.0, if picked || packing { t.accent } else { t.fill_driven });
+        }
+        let text = Rect::from_corners(pt2(row.right() - 34.0, row.bottom()), pt2(row.right() - 4.0, row.top()));
+        draw.text(&fmt_num(*value)).xy(text.xy()).wh(text.wh()).right_justify().no_line_wrap().color(text_color).font_size(11);
     }
 }
 
@@ -4315,9 +4500,30 @@ fn draw_video_controls(draw: &Draw, t: &Theme, model: &Model, id: u64, video: &V
 /// Ports are always drawn in their signal-type color, so the type is
 /// visible regardless of connection state: connected ports are solid,
 /// unconnected ones are rings. Hovered ports grow.
-fn draw_port(draw: &Draw, t: &Theme, pos: Point2, port_type: PortType, connected: bool, hovered: bool) {
+/// How a number port shows arrays: a ring around it (solid while one
+/// flows through, faint on an input that could take one).
+#[derive(Clone, Copy, PartialEq)]
+enum ArrayMark {
+    None,
+    Accepts,
+    Carries,
+}
+
+fn draw_port(draw: &Draw, t: &Theme, pos: Point2, port_type: PortType, mark: ArrayMark, connected: bool, hovered: bool) {
     let color = t.port(port_type);
     let r = if hovered { PORT_RADIUS + 3.0 } else { PORT_RADIUS };
+    match mark {
+        ArrayMark::None => {}
+        ArrayMark::Accepts => {
+            let mut faint = color;
+            faint.alpha = 110;
+            draw.ellipse().xy(pos).radius(r + 4.0).no_fill().stroke(faint).stroke_weight(1.0);
+        }
+        ArrayMark::Carries => {
+            draw.ellipse().xy(pos).radius(r + 4.5).no_fill().stroke(t.port_ring).stroke_weight(3.5);
+            draw.ellipse().xy(pos).radius(r + 4.5).no_fill().stroke(color).stroke_weight(2.0);
+        }
+    }
     if connected {
         draw.ellipse().xy(pos).radius(r).color(color).stroke(t.port_ring).stroke_weight(2.0);
     } else {
@@ -4361,6 +4567,8 @@ const HELP_LEFT: &[HelpRow] = &[
     Item("Drop on a cable", "Replace that cable"),
     Item("Move node on cable", "Insert it in the path"),
     Item("Click the Stack pill", "Order its layers"),
+    Item("Ringed port / double cable", "Carries an array"),
+    Item("Select rows", "Pick: one output each"),
 ];
 
 const HELP_RIGHT: &[HelpRow] = &[
@@ -4619,13 +4827,13 @@ fn cable_ends(model: &Model, c: &Connection) -> Option<(Point2, Point2)> {
             return None;
         }
     }
-    let start = from_group.map_or_else(|| module_output_port(module_body_rect(from)), |(_, f)| group::collapsed_port(f, true));
+    let start = from_group.map_or_else(|| output_port_pos(from, c.from_output), |(_, f)| group::collapsed_port(f, true));
     let end = to_group.map_or_else(
         || {
             let body = module_body_rect(to);
             if multi_input::is_multi(to.kind, c.to_input) && !is_minimized_body(body) {
-                let layers = multi_input::sources(&model.connections, to.id, c.to_input);
-                let k = layers.iter().position(|s| *s == c.from).unwrap_or(0);
+                let layers = multi_input::source_ports(&model.connections, to.id, c.to_input);
+                let k = layers.iter().position(|s| *s == (c.from, c.from_output)).unwrap_or(0);
                 return pill_slot(body, k, layers.len());
             }
             module_input_port(to, body, c.to_input, to_inputs)
@@ -4641,14 +4849,14 @@ fn draw_cables(draw: &Draw, t: &Theme, model: &Model, mouse: Point2) {
     let candidate = match model.dragging {
         Some(Drag::Module { id, start, .. }) => insert_candidate(model, id, start).map(|(index, _)| index),
         // A cable being dragged lights up the cable it would replace.
-        Some(Drag::Cable { from }) if !over_any_input_port(model, from, mouse) => cable_drop_target(model, from, mouse),
+        Some(Drag::Cable { from, output }) if !over_any_input_port(model, from, output, mouse) => cable_drop_target(model, from, output, mouse),
         _ => None,
     };
     for (index, c) in model.connections.iter().enumerate() {
         let Some((start, end)) = cable_ends(model, c) else { continue };
-        let Some(from) = model.modules.iter().find(|m| m.id == c.from) else { continue };
-        let color = if candidate == Some(index) { t.accent } else { output_type(from.kind).map_or(t.text_dim, |p| t.port(p)) };
-        draw_cable(draw, t, start, end, color);
+        let signal = port_signal(model, c.from, c.from_output);
+        let color = if candidate == Some(index) { t.accent } else { signal.map_or(t.text_dim, |p| t.port(p)) };
+        draw_cable(draw, t, start, end, color, signal == Some(PortType::Numbers));
     }
 }
 
@@ -4662,27 +4870,29 @@ const INSERT_MIN_DRAG: f32 = 6.0;
 /// How close (world units) a dragged cable's end must be to another cable to replace it.
 const CABLE_DROP_RADIUS: f32 = 14.0;
 
-fn over_any_input_port(model: &Model, from: u64, world: Point2) -> bool {
-    let Some(from_type) = model.modules.iter().find(|m| m.id == from).and_then(|m| output_type(m.kind)) else { return false };
+fn over_any_input_port(model: &Model, from: u64, output: usize, world: Point2) -> bool {
+    let Some(from_type) = port_signal(model, from, output) else { return false };
     model.modules.iter().filter(|m| !model.hidden(m.id)).any(|m| {
         let types = m.input_types();
         let body = module_body_rect(m);
-        types.iter().enumerate().any(|(i, ty)| *ty == from_type && port_hit(m, body, i, types.len(), world))
+        types.iter().enumerate().any(|(i, ty)| ty.accepts(from_type) && port_hit(m, body, i, types.len(), world))
     })
 }
 
 /// The existing cable (index into `connections`) that a cable dragged from
-/// `from` and dropped at `world` would replace: the nearest one of the same
-/// signal type under the pointer, if the swap wouldn't loop back.
-fn cable_drop_target(model: &Model, from: u64, world: Point2) -> Option<usize> {
-    let from_type = model.modules.iter().find(|m| m.id == from).and_then(|m| output_type(m.kind))?;
+/// `from`'s output `output` and dropped at `world` would replace: the nearest
+/// one under the pointer whose input takes the same signal, if the swap
+/// wouldn't loop back.
+fn cable_drop_target(model: &Model, from: u64, output: usize, world: Point2) -> Option<usize> {
+    let from_type = port_signal(model, from, output)?;
     let mut best: Option<(usize, f32)> = None;
     for (index, c) in model.connections.iter().enumerate() {
         if c.from == from || c.to == from {
             continue;
         }
         let Some((start, end)) = cable_ends(model, c) else { continue };
-        if model.modules.iter().find(|m| m.id == c.from).and_then(|m| output_type(m.kind)) != Some(from_type) {
+        let input = model.modules.iter().find(|m| m.id == c.to).and_then(|m| m.input_types().get(c.to_input).copied());
+        if !input.is_some_and(|i| i.accepts(from_type)) {
             continue;
         }
         if reaches(&model.connections, c.to, from, &mut Vec::new()) {
@@ -4710,6 +4920,10 @@ fn insert_candidate(model: &Model, id: u64, start: Point2) -> Option<(usize, usi
         return None;
     }
     let module = model.modules.iter().find(|m| m.id == id)?;
+    // A Select has no output until something in it is picked.
+    if module.kind == ModuleKind::Select {
+        return None;
+    }
     if module.pos.distance(start) < INSERT_MIN_DRAG {
         return None;
     }
@@ -4722,14 +4936,23 @@ fn insert_candidate(model: &Model, id: u64, start: Point2) -> Option<(usize, usi
             continue;
         }
         let Some((cable_start, cable_end)) = cable_ends(model, c) else { continue };
-        let Some(signal) = model.modules.iter().find(|m| m.id == c.from).and_then(|m| output_type(m.kind)) else { continue };
-        if output_type(module.kind) != Some(signal) {
-            continue;
-        }
-        let Some(input) = (0..inputs.len()).find(|&n| inputs[n] == signal && input_source(&model.connections, id, n).is_none())
+        let Some(signal) = port_signal(model, c.from, c.from_output) else { continue };
+        let Some(input) = (0..inputs.len()).find(|&n| inputs[n].accepts(signal) && input_source(&model.connections, id, n).is_none())
         else {
             continue;
         };
+        // What the module would send on: a math module passes an array on as one.
+        let sends = match output_type(module.kind) {
+            Some(PortType::Number) if inputs[input] == PortType::Numbers => signal,
+            other => match other {
+                Some(o) => o,
+                None => continue,
+            },
+        };
+        let takes = model.modules.iter().find(|m| m.id == c.to).and_then(|m| m.input_types().get(c.to_input).copied());
+        if !takes.is_some_and(|t| t.accepts(sends)) {
+            continue;
+        }
         // Wiring `from -> module` must not close a loop through the module.
         if reaches(&model.connections, id, c.from, &mut Vec::new()) {
             continue;
@@ -4749,9 +4972,10 @@ fn insert_candidate(model: &Model, id: u64, start: Point2) -> Option<(usize, usi
 /// Splits connection `index` (`a -> b`) into `a -> module` (at `input`) and
 /// `module -> b`.
 fn insert_into_cable(model: &mut Model, id: u64, index: usize, input: usize) {
-    let Connection { from, to, to_input } = model.connections.remove(index);
-    model.connections.push(Connection { from, to: id, to_input: input });
-    model.connections.push(Connection { from: id, to, to_input });
+    let Connection { from, from_output, to, to_input } = model.connections.remove(index);
+    model.connections.push(Connection { from, from_output, to: id, to_input: input });
+    model.connections.push(Connection { from: id, from_output: 0, to, to_input });
+    drop_mismatched(&model.modules, &mut model.connections);
 }
 
 /// Modules dropped with their center inside an open group's frame join it
@@ -4884,11 +5108,12 @@ fn draw_groups(draw: &Draw, t: &Theme, model: &Model, now: f32, hover: Option<Po
 }
 
 fn draw_dragged_cable(draw: &Draw, t: &Theme, app: &App, model: &Model) {
-    if let Some(Drag::Cable { from }) = &model.dragging {
-        if let Some(module) = model.modules.iter().find(|m| m.id == *from) {
-            let color = output_type(module.kind).map_or(t.text_dim, |p| t.port(p));
+    if let Some(Drag::Cable { from, output }) = model.dragging {
+        if let Some(module) = model.modules.iter().find(|m| m.id == from) {
+            let signal = port_signal(model, from, output);
+            let color = signal.map_or(t.text_dim, |p| t.port(p));
             let end = to_world(model, pt2(app.mouse.x, app.mouse.y));
-            draw_cable(draw, t, module_output_port(module_body_rect(module)), end, color);
+            draw_cable(draw, t, output_port_pos(module, output), end, color, signal == Some(PortType::Numbers));
         }
     }
 }
@@ -4907,10 +5132,24 @@ fn cable_points(start: Point2, end: Point2) -> Vec<Point2> {
 }
 
 /// A cable as a horizontal S-curve, so it leaves and enters ports sideways.
-fn draw_cable(draw: &Draw, t: &Theme, start: Point2, end: Point2, color: ui::Color) {
+/// An array's cable is drawn doubled: two strands side by side.
+fn draw_cable(draw: &Draw, t: &Theme, start: Point2, end: Point2, color: ui::Color, array: bool) {
     let points = cable_points(start, end);
-    draw.polyline().weight(6.0).color(t.shadow).points(points.clone());
-    draw.polyline().weight(3.5).color(color).points(points);
+    if !array {
+        draw.polyline().weight(6.0).color(t.shadow).points(points.clone());
+        draw.polyline().weight(3.5).color(color).points(points);
+        return;
+    }
+    draw.polyline().weight(9.0).color(t.shadow).points(points.clone());
+    let normal = |i: usize| {
+        let (a, b) = (points[i.saturating_sub(1)], points[(i + 1).min(points.len() - 1)]);
+        let d = (b - a).normalize_or_zero();
+        vec2(-d.y, d.x)
+    };
+    for side in [-2.2, 2.2] {
+        let strand: Vec<Point2> = (0..points.len()).map(|i| points[i] + normal(i) * side).collect();
+        draw.polyline().weight(2.0).color(color).points(strand);
+    }
 }
 
 /// Draws whatever Output currently carries: its cached preview texture

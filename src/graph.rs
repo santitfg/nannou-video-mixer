@@ -8,7 +8,7 @@
 use crate::modules::effects::shader::compile_pending;
 use crate::modules::sources::camera::CameraState;
 use crate::modules::sources::video::VideoState;
-use crate::modules::{input_source, multi_input, ModuleKind, module_number, reaches, Connection, ModuleBody, PlacedModule};
+use crate::modules::{input_number, input_source, multi_input, ModuleKind, reaches, Connection, ModuleBody, PlacedModule};
 use crate::gpu::VideoTex;
 use crate::Model;
 use nannou::prelude::*;
@@ -74,8 +74,7 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
             input_source(&model.connections, id, input).and_then(|src| results.get(&src).cloned())
         };
         let number_in = |modules: &[PlacedModule], input: usize| {
-            input_source(&model.connections, id, input)
-                .and_then(|src| module_number(modules, &model.connections, src, now, &mut vec![id]))
+            input_number(modules, &model.connections, id, input, now, &mut vec![id])
         };
 
         let produced = match &model.modules[idx].body {
@@ -117,6 +116,7 @@ pub fn run_graph(app: &App, model: &mut Model, delta: f32) {
             | ModuleBody::Lag(_)
             | ModuleBody::Map(_)
             | ModuleBody::Wled(_)
+            | ModuleBody::Select(_)
             | ModuleBody::Osc(_) => None,
         };
 

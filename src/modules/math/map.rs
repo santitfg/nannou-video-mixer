@@ -63,16 +63,21 @@ impl MapState {
         }
     }
 
-    /// Autorange: widens From to cover every input seen so far.
-    pub fn learn(&mut self, input: Option<f32>) {
+    /// Autorange: widens From to cover every input seen so far (every
+    /// element, when the input is an array: they share one range).
+    pub fn learn(&mut self, input: &[f32]) {
         if !self.auto {
             return;
         }
-        let Some(x) = input.map(|x| x + self.fields[BIAS].value) else { return };
-        let (lo, hi) = self.seen.map_or((x, x), |(lo, hi)| (lo.min(x), hi.max(x)));
-        self.seen = Some((lo, hi));
-        self.fields[0].set(lo);
-        self.fields[1].set(hi);
+        let bias = self.fields[BIAS].value;
+        for x in input.iter().map(|x| x + bias) {
+            let (lo, hi) = self.seen.map_or((x, x), |(lo, hi)| (lo.min(x), hi.max(x)));
+            self.seen = Some((lo, hi));
+        }
+        if let Some((lo, hi)) = self.seen {
+            self.fields[0].set(lo);
+            self.fields[1].set(hi);
+        }
     }
 
     /// Forgets what autorange has learned.
@@ -111,11 +116,19 @@ mod tests {
         m.center = true;
         m.calibrate(0.5);
         for x in [0.5, 0.0, 1.5] {
-            m.learn(Some(x));
+            m.learn(&[x]);
         }
         assert_eq!((m.fields[0].value, m.fields[1].value), (-0.5, 1.0));
         assert_eq!(m.apply(0.5), 0.5);
         assert_eq!(m.apply(1.5), 1.0);
         assert_eq!(m.apply(0.0), 0.0);
+    }
+
+    #[test]
+    fn autorange_over_an_array_shares_one_range() {
+        let mut m = MapState::new();
+        m.auto = true;
+        m.learn(&[0.2, 0.6, 0.4]);
+        assert_eq!((m.fields[0].value, m.fields[1].value), (0.2, 0.6));
     }
 }

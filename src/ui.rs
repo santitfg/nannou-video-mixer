@@ -101,6 +101,7 @@ impl Theme {
             | ModuleKind::Lag
             | ModuleKind::Map
             | ModuleKind::Osc
+            | ModuleKind::Select
             | ModuleKind::Wled => self.math,
         }
     }
@@ -108,7 +109,7 @@ impl Theme {
     pub fn port(&self, port: PortType) -> Color {
         match port {
             PortType::Video => self.video_port,
-            PortType::Number => self.number_port,
+            PortType::Number | PortType::Numbers => self.number_port,
         }
     }
 }
@@ -344,6 +345,35 @@ pub fn label_left(draw: &Draw, rect: Rect, text: &str, color: Color, size: u32) 
         .no_line_wrap()
         .color(color)
         .font_size(size);
+}
+
+/// `text` broken into lines no wider than `width` at font `size`: between
+/// words where it can, mid-word for a word too long to fit on its own.
+pub fn wrap(text: &str, width: f32, size: u32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+        if text_width(&candidate, size) <= width {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        for ch in word.chars() {
+            line.push(ch);
+            if text_width(&line, size) > width && line.chars().count() > 1 {
+                let last = line.pop().unwrap();
+                lines.push(std::mem::take(&mut line));
+                line.push(last);
+            }
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Width in pixels of `text` at font `size`, as `label_left` lays it out.

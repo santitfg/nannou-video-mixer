@@ -4,6 +4,7 @@ pub mod mix;
 pub mod multi_input;
 pub mod output;
 pub mod param;
+pub mod signal;
 pub mod sources;
 
 use crate::ModuleChrome;
@@ -16,10 +17,12 @@ use math::{
     mult::MultState,
     number::NumberState,
     osc::OscState,
+    select::SelectState,
 };
 use mix::blend::BlendState;
 use nannou::prelude::*;
 use output::OutputState;
+pub use signal::Signal;
 use serde::{Deserialize, Serialize};
 use sources::camera::CameraState;
 use sources::video::VideoState;
@@ -59,6 +62,7 @@ pub enum ModuleKind {
     /// Blend with one multi-cable video input (any number of layers).
     Stack,
     Osc,
+    Select,
 }
 
 impl ModuleKind {
@@ -109,18 +113,32 @@ pub const CATEGORIES: &[(&str, &[(&str, ModuleKind)])] = &[
             ("LFO", ModuleKind::Lfo),
             ("Lag", ModuleKind::Lag),
             ("Map", ModuleKind::Map),
+            ("Select", ModuleKind::Select),
         ],
     ),
     // Filled from the shaders folder, by category: see `sidebar_rows`.
     ("Effects", &[]),
 ];
 
-/// The two kinds of signal a port can carry. Each palette gives them their
-/// own color (see `ui::Theme::port`), independent of module body colors.
+/// The kinds of signal a port can carry. Each palette gives video and
+/// numbers their own color (see `ui::Theme::port`), independent of module
+/// body colors; an array of numbers shares the number color and is told
+/// apart by its shape (a ring around the port, a doubled cable).
+///
+/// As an input, `Numbers` means "a number or an array": the math modules
+/// work on either. An array never lands on a plain `Number` input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortType {
     Video,
     Number,
+    Numbers,
+}
+
+impl PortType {
+    /// Whether a cable carrying `signal` can plug into an input of this type.
+    pub fn accepts(self, signal: PortType) -> bool {
+        self == signal || (self == PortType::Numbers && signal == PortType::Number)
+    }
 }
 
 pub fn kind_label(kind: ModuleKind) -> &'static str {
@@ -142,6 +160,7 @@ pub fn kind_label(kind: ModuleKind) -> &'static str {
         ModuleKind::ShaderMix => "Shader Mix",
         ModuleKind::Stack => "Stack",
         ModuleKind::Osc => "OSC",
+        ModuleKind::Select => "Select",
     }
 }
 
@@ -163,15 +182,20 @@ pub fn input_types(kind: ModuleKind) -> &'static [PortType] {
         // Port 0 takes any number of cables (see `multi_input`); port 1 drives the mix.
         ModuleKind::Stack => &[PortType::Video, PortType::Number],
         ModuleKind::Output => &[PortType::Video],
-        ModuleKind::Mult => &[PortType::Number, PortType::Number],
-        ModuleKind::Lag | ModuleKind::Map => &[PortType::Number],
+        // Each takes a number or an array, and sends the same kind on.
+        ModuleKind::Mult => &[PortType::Numbers, PortType::Numbers],
+        ModuleKind::Lag | ModuleKind::Map => &[PortType::Numbers],
+        // A multi-input pill: every cable's values, end to end.
+        ModuleKind::Select => &[PortType::Numbers],
         ModuleKind::Wled => &[],
         // Speed, then scrub (a wired scrub drives the playhead directly).
         ModuleKind::Video => &[PortType::Number, PortType::Number],
     }
 }
 
-/// The type of a module's single output port, or `None` if it has no output.
+/// The type of a module's output ports, or `None` if it has no output. A
+/// math module fed an array sends an array: see `signal_type` for what a
+/// given port actually carries.
 pub fn output_type(kind: ModuleKind) -> Option<PortType> {
     match kind {
         ModuleKind::Camera
@@ -190,7 +214,8 @@ pub fn output_type(kind: ModuleKind) -> Option<PortType> {
         | ModuleKind::Lag
         | ModuleKind::Map
         | ModuleKind::Osc
-        | ModuleKind::Wled => Some(PortType::Number),
+        | ModuleKind::Select => Some(PortType::Number),
+        ModuleKind::Wled => Some(PortType::Numbers),
     }
 }
 
@@ -218,6 +243,7 @@ pub fn has_config_row(kind: ModuleKind) -> bool {
         | ModuleKind::Map
         | ModuleKind::Wled
         | ModuleKind::Mult
+        | ModuleKind::Select
         | ModuleKind::Shader
         | ModuleKind::Generator
         | ModuleKind::Effect
@@ -243,6 +269,7 @@ pub fn base_height(kind: ModuleKind) -> f32 {
         ModuleKind::Map => 198.0,
         // Grows with its inputs: see `PlacedModule::base_height`.
         ModuleKind::Wled => WLED_ROWS_TOP + 40.0,
+        ModuleKind::Select => SELECT_ROWS_TOP + SELECT_ROW_H + 12.0,
         _ if has_config_row(kind) => 90.0,
         _ => 64.0,
     }
@@ -279,6 +306,7 @@ pub enum ModuleBody {
     Wled(WledState),
     Shader(ShaderState),
     Osc(OscState),
+    Select(SelectState),
 }
 
 impl ModuleBody {
@@ -296,6 +324,7 @@ impl ModuleBody {
             ModuleBody::Wled(s) => &s.chrome,
             ModuleBody::Shader(s) => &s.chrome,
             ModuleBody::Osc(s) => &s.chrome,
+            ModuleBody::Select(s) => &s.chrome,
         }
     }
 
@@ -313,6 +342,7 @@ impl ModuleBody {
             ModuleBody::Wled(s) => &mut s.chrome,
             ModuleBody::Shader(s) => &mut s.chrome,
             ModuleBody::Osc(s) => &mut s.chrome,
+            ModuleBody::Select(s) => &mut s.chrome,
         }
     }
 }
@@ -333,6 +363,17 @@ pub const SHADER_PICKER_H: f32 = 36.0;
 /// Where a WLED module's input rows start, and how tall each is.
 pub const WLED_ROWS_TOP: f32 = 96.0;
 pub const WLED_ROW_H: f32 = 26.0;
+/// Each extra line of a wrapped WLED status pushes the rows down this much.
+pub const WLED_STATUS_LINE_H: f32 = 14.0;
+
+/// Where a WLED module's input rows start: below its status, however many
+/// lines that wrapped to.
+pub fn wled_rows_top(w: &WledState) -> f32 {
+    WLED_ROWS_TOP + (w.status.len().max(1) - 1) as f32 * WLED_STATUS_LINE_H
+}
+/// Where a Select's element rows start (under its mode row), and how tall each is.
+pub const SELECT_ROWS_TOP: f32 = 72.0;
+pub const SELECT_ROW_H: f32 = 28.0;
 
 impl PlacedModule {
     /// The type of each input port, in order. Fixed per kind, except Shader,
@@ -360,16 +401,21 @@ impl PlacedModule {
                 let shift = self.port_shift();
                 (SHADER_PORT_TOP - shift + ports * SHADER_PORT_STEP + 4.0).max(base_height(self.kind) - shift)
             }
-            ModuleBody::Wled(w) => WLED_ROWS_TOP + w.inputs.len().max(1) as f32 * WLED_ROW_H + 40.0,
+            ModuleBody::Wled(w) => wled_rows_top(w) + w.inputs.len().max(1) as f32 * WLED_ROW_H + 40.0,
+            ModuleBody::Select(s) => SELECT_ROWS_TOP + s.values.len().max(1) as f32 * SELECT_ROW_H + 12.0,
             _ => base_height(self.kind),
         }
     }
 }
 
-/// One cable: `from`'s output feeds `to`'s input number `to_input`. An
-/// input can carry at most one connection; an output can fan out to many.
+/// One cable: `from`'s output number `from_output` feeds `to`'s input
+/// number `to_input`. An input can carry at most one connection (unless
+/// it's a multi port); an output can fan out to many. Every module has one
+/// output except Select, which has one per element it splits out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Connection {
     pub from: u64,
+    pub from_output: usize,
     pub to: u64,
     pub to_input: usize,
 }
@@ -387,6 +433,7 @@ pub fn push_module(modules: &mut Vec<PlacedModule>, next_id: &mut u64, kind: Mod
         ModuleKind::Lag => ModuleBody::Lag(LagState::new()),
         ModuleKind::Map => ModuleBody::Map(MapState::new()),
         ModuleKind::Wled => ModuleBody::Wled(WledState::new()),
+        ModuleKind::Select => ModuleBody::Select(SelectState::new()),
         ModuleKind::Shader | ModuleKind::Generator | ModuleKind::Effect | ModuleKind::Feedback | ModuleKind::ShaderMix => {
             ModuleBody::Shader(ShaderState::new())
         }
@@ -397,50 +444,91 @@ pub fn push_module(modules: &mut Vec<PlacedModule>, next_id: &mut u64, kind: Mod
     id
 }
 
+/// The module wired into `to`'s input `to_input`, if any.
 pub(crate) fn input_source(connections: &[Connection], to: u64, to_input: usize) -> Option<u64> {
+    input_port(connections, to, to_input).map(|(from, _)| from)
+}
+
+/// The module and output port wired into `to`'s input `to_input`, if any.
+pub(crate) fn input_port(connections: &[Connection], to: u64, to_input: usize) -> Option<(u64, usize)> {
     connections
         .iter()
         .find(|c| c.to == to && c.to_input == to_input)
-        .map(|c| c.from)
+        .map(|c| (c.from, c.from_output))
 }
 
-/// Computes the current number a module's output carries (normalized,
-/// 0..1 by convention): Number where its value sits in its range, LFO its
-/// current oscillation, Mult the product of its two inputs (or whichever
-/// one is connected, if only one is). Math is
-/// cheap enough that, unlike video frames, this is just recomputed fresh
-/// every time it's needed rather than cached.
-pub fn module_number(
+/// What's arriving at `to`'s input `to_input`: a number or an array.
+pub fn input_signal(
     modules: &[PlacedModule],
     connections: &[Connection],
-    id: u64,
+    to: u64,
+    to_input: usize,
+    now: f32,
+    visiting: &mut Vec<u64>,
+) -> Option<Signal> {
+    let (from, output) = input_port(connections, to, to_input)?;
+    module_signal(modules, connections, from, output, now, visiting)
+}
+
+/// The single number arriving at `to`'s input `to_input`. An array (which
+/// never plugs into a plain number input) reads as nothing.
+pub fn input_number(
+    modules: &[PlacedModule],
+    connections: &[Connection],
+    to: u64,
+    to_input: usize,
     now: f32,
     visiting: &mut Vec<u64>,
 ) -> Option<f32> {
+    input_signal(modules, connections, to, to_input, now, visiting)?.as_one()
+}
+
+/// A Select's input: every cable on its pill, in plugging order, laid end
+/// to end.
+pub fn select_input(modules: &[PlacedModule], connections: &[Connection], id: u64, now: f32, visiting: &mut Vec<u64>) -> Vec<f32> {
+    multi_input::source_ports(connections, id, 0)
+        .into_iter()
+        .filter_map(|(from, output)| module_signal(modules, connections, from, output, now, visiting))
+        .flat_map(|s| s.values().to_vec())
+        .collect()
+}
+
+/// The current number (or array) on output `output` of module `id`
+/// (normalized, 0..1 by convention): Number where its value sits in its
+/// range, LFO its current oscillation, Mult the product of its two inputs
+/// (or whichever one is connected, if only one is), WLED all its inputs.
+/// Math is cheap enough that, unlike video frames, this is just recomputed
+/// fresh every time it's needed rather than cached.
+pub fn module_signal(
+    modules: &[PlacedModule],
+    connections: &[Connection],
+    id: u64,
+    output: usize,
+    now: f32,
+    visiting: &mut Vec<u64>,
+) -> Option<Signal> {
     if visiting.contains(&id) {
         return None;
     }
     visiting.push(id);
 
+    let one = |x: Option<f32>| if output == 0 { x.map(Signal::One) } else { None };
     let result = modules.iter().find(|m| m.id == id).and_then(|m| match &m.body {
-        ModuleBody::Number(number) => Some(number.value.output_norm()),
-        ModuleBody::Lfo(lfo) => Some(lfo.sample(now, id)),
+        ModuleBody::Number(number) => one(Some(number.value.output_norm())),
+        ModuleBody::Lfo(lfo) => one(Some(lfo.sample(now, id))),
         // Advanced once per tick in `update` (it has state).
-        ModuleBody::Lag(lag) => lag.output(),
-        ModuleBody::Map(map) => input_source(connections, id, 0)
-            .and_then(|src| module_number(modules, connections, src, now, visiting))
-            .map(|x| map.apply(x)),
+        ModuleBody::Lag(lag) => lag.output().filter(|_| output == 0),
+        ModuleBody::Map(map) => input_signal(modules, connections, id, 0, now, visiting).map(|x| x.map(|x| map.apply(x))),
         // Refreshed from the device every tick in `update`.
-        ModuleBody::Wled(wled) => wled.output(),
+        ModuleBody::Wled(wled) => (output == 0).then(|| Signal::Many(wled.output())),
         // Updated from the socket every tick in `update`.
-        ModuleBody::Osc(osc) => osc.output(),
+        ModuleBody::Osc(osc) => one(osc.output()),
+        ModuleBody::Select(select) => select.apply(&select_input(modules, connections, id, now, visiting), output),
         ModuleBody::Mult(_) => {
-            let a = input_source(connections, id, 0)
-                .and_then(|src| module_number(modules, connections, src, now, visiting));
-            let b = input_source(connections, id, 1)
-                .and_then(|src| module_number(modules, connections, src, now, visiting));
+            let a = input_signal(modules, connections, id, 0, now, visiting);
+            let b = input_signal(modules, connections, id, 1, now, visiting);
             match (a, b) {
-                (Some(a), Some(b)) => Some(a * b),
+                (Some(a), Some(b)) => Some(a.zip_with(&b, |a, b| a * b)),
                 (Some(a), None) | (None, Some(a)) => Some(a),
                 (None, None) => None,
             }
@@ -454,6 +542,113 @@ pub fn module_number(
     result
 }
 
+/// The single number on module `id`'s first output (nothing if it's an array).
+pub fn module_number(
+    modules: &[PlacedModule],
+    connections: &[Connection],
+    id: u64,
+    now: f32,
+    visiting: &mut Vec<u64>,
+) -> Option<f32> {
+    module_signal(modules, connections, id, 0, now, visiting)?.as_one()
+}
+
+/// What output `output` of module `id` carries: an array if it's a WLED,
+/// a Select in Combine mode, or a math module with an array wired into it.
+/// Follows the cables upstream (computed from the wiring, not the values,
+/// so it holds even before a device reports anything).
+pub fn signal_type(modules: &[PlacedModule], connections: &[Connection], id: u64, output: usize, visiting: &mut Vec<u64>) -> Option<PortType> {
+    let module = modules.iter().find(|m| m.id == id)?;
+    let base = output_type(module.kind)?;
+    if visiting.contains(&id) {
+        return Some(base);
+    }
+    visiting.push(id);
+    let result = match &module.body {
+        ModuleBody::Select(s) => Some(if s.combine && output == 0 { PortType::Numbers } else { PortType::Number }),
+        ModuleBody::Map(_) | ModuleBody::Lag(_) | ModuleBody::Mult(_) => {
+            let any_array = (0..input_types(module.kind).len()).any(|n| {
+                input_port(connections, id, n)
+                    .and_then(|(from, out)| signal_type(modules, connections, from, out, visiting))
+                    == Some(PortType::Numbers)
+            });
+            Some(if any_array { PortType::Numbers } else { PortType::Number })
+        }
+        _ => Some(base),
+    };
+    visiting.pop();
+    result
+}
+
+/// Cables whose source sends something their input can't take (a math
+/// module turned into an array by a new cable upstream, still wired into a
+/// plain number input), as indexes into `connections`.
+pub fn mismatched(modules: &[PlacedModule], connections: &[Connection]) -> Vec<usize> {
+    connections
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            let Some(to) = modules.iter().find(|m| m.id == c.to) else { return false };
+            let Some(&input) = to.input_types().get(c.to_input) else { return false };
+            signal_type(modules, connections, c.from, c.from_output, &mut Vec::new()).is_some_and(|s| !input.accepts(s))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Unplugs every cable `mismatched` finds (repeatedly: unplugging one can
+/// change what's downstream of it).
+pub fn drop_mismatched(modules: &[PlacedModule], connections: &mut Vec<Connection>) {
+    loop {
+        let bad = mismatched(modules, connections);
+        if bad.is_empty() {
+            return;
+        }
+        for i in bad.into_iter().rev() {
+            connections.remove(i);
+        }
+    }
+}
+
+/// Labels for the elements of what output `output` of `id` carries: WLED
+/// names its inputs by GPIO, a Select passes its own on, and math modules
+/// keep their input's. Anything else is numbered from 1.
+pub fn signal_labels(modules: &[PlacedModule], connections: &[Connection], id: u64, output: usize, len: usize, visiting: &mut Vec<u64>) -> Vec<String> {
+    let numbered = |from: usize, n: usize| (from..from + n).map(|i| (i + 1).to_string()).collect::<Vec<_>>();
+    let Some(module) = modules.iter().find(|m| m.id == id) else { return numbered(0, len) };
+    if visiting.contains(&id) {
+        return numbered(0, len);
+    }
+    visiting.push(id);
+    let mut labels = match &module.body {
+        ModuleBody::Wled(w) => w.labels(),
+        ModuleBody::Select(s) if s.combine => s
+            .labels
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| s.selected.iter().all(|x| !x) || s.is_selected(*i))
+            .map(|(_, l)| l.clone())
+            .collect(),
+        ModuleBody::Select(s) => s.labels.get(output).cloned().into_iter().collect(),
+        ModuleBody::Map(_) | ModuleBody::Lag(_) | ModuleBody::Mult(_) => {
+            // The first input carrying an array names the elements.
+            (0..input_types(module.kind).len())
+                .filter_map(|n| input_port(connections, id, n))
+                .find(|&(from, out)| signal_type(modules, connections, from, out, &mut Vec::new()) == Some(PortType::Numbers))
+                .map(|(from, out)| signal_labels(modules, connections, from, out, len, visiting))
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    visiting.pop();
+    let have = labels.len();
+    if have < len {
+        labels.extend(numbered(have, len - have));
+    }
+    labels.truncate(len);
+    labels
+}
+
 /// True if `id`'s output is wired, through any chain of modules, into
 /// `target`'s input.
 pub fn reaches(connections: &[Connection], from: u64, target: u64, visiting: &mut Vec<u64>) -> bool {
@@ -465,4 +660,92 @@ pub fn reaches(connections: &[Connection], from: u64, target: u64, visiting: &mu
     }
     visiting.push(from);
     connections.iter().any(|c| c.from == from && reaches(connections, c.to, target, visiting))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sources::wled::InputView;
+
+    fn wled_with(values: &[f32]) -> WledState {
+        let mut w = WledState::new();
+        w.inputs = values
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| InputView { gpio: 30 + i as u8, kind: "Analog", value, raw: 0, active: false })
+            .collect();
+        w
+    }
+
+    fn placed(id: u64, kind: ModuleKind, body: ModuleBody) -> PlacedModule {
+        PlacedModule { id, kind, pos: pt2(0.0, 0.0), body }
+    }
+
+    fn cable(from: u64, from_output: usize, to: u64, to_input: usize) -> Connection {
+        Connection { from, from_output, to, to_input }
+    }
+
+    #[test]
+    fn map_scales_a_whole_array_and_select_splits_it() {
+        let mut map = MapState::new();
+        map.fields[3].set(2.0); // 0..1 -> 0..2
+        let mut select = SelectState::new();
+        select.toggle(2);
+        let modules = vec![
+            placed(1, ModuleKind::Wled, ModuleBody::Wled(wled_with(&[0.1, 0.2, 0.4]))),
+            placed(2, ModuleKind::Map, ModuleBody::Map(map)),
+            placed(3, ModuleKind::Select, ModuleBody::Select(select)),
+        ];
+        let connections = vec![cable(1, 0, 2, 0), cable(2, 0, 3, 0)];
+        assert_eq!(module_signal(&modules, &connections, 2, 0, 0.0, &mut Vec::new()), Some(Signal::Many(vec![0.2, 0.4, 0.8])));
+        assert_eq!(signal_type(&modules, &connections, 2, 0, &mut Vec::new()), Some(PortType::Numbers));
+        assert_eq!(module_signal(&modules, &connections, 3, 2, 0.0, &mut Vec::new()), Some(Signal::One(0.8)));
+        assert_eq!(module_signal(&modules, &connections, 3, 0, 0.0, &mut Vec::new()), None, "element 0 isn't picked");
+        assert_eq!(signal_labels(&modules, &connections, 2, 0, 3, &mut Vec::new())[2], "32 \u{00B7} Analog");
+    }
+
+    #[test]
+    fn mult_broadcasts_a_number_over_an_array() {
+        let mut number = NumberState::new();
+        number.value.set(0.5);
+        let modules = vec![
+            placed(1, ModuleKind::Wled, ModuleBody::Wled(wled_with(&[0.2, 1.0]))),
+            placed(2, ModuleKind::Number, ModuleBody::Number(number)),
+            placed(3, ModuleKind::Mult, ModuleBody::Mult(MultState::new())),
+        ];
+        let connections = vec![cable(1, 0, 3, 0), cable(2, 0, 3, 1)];
+        assert_eq!(module_signal(&modules, &connections, 3, 0, 0.0, &mut Vec::new()), Some(Signal::Many(vec![0.1, 0.5])));
+        assert_eq!(module_number(&modules, &connections, 3, 0.0, &mut Vec::new()), None, "an array isn't a single number");
+    }
+
+    #[test]
+    fn select_packs_single_numbers_into_an_array() {
+        let (mut a, mut b) = (NumberState::new(), NumberState::new());
+        a.value.set(0.25);
+        b.value.set(0.75);
+        let mut select = SelectState::new();
+        select.combine = true;
+        let modules = vec![
+            placed(1, ModuleKind::Number, ModuleBody::Number(a)),
+            placed(2, ModuleKind::Number, ModuleBody::Number(b)),
+            placed(3, ModuleKind::Select, ModuleBody::Select(select)),
+        ];
+        let connections = vec![cable(2, 0, 3, 0), cable(1, 0, 3, 0)];
+        assert_eq!(module_signal(&modules, &connections, 3, 0, 0.0, &mut Vec::new()), Some(Signal::Many(vec![0.75, 0.25])));
+        assert_eq!(signal_type(&modules, &connections, 3, 0, &mut Vec::new()), Some(PortType::Numbers));
+    }
+
+    #[test]
+    fn an_array_reaching_a_plain_number_input_is_unplugged() {
+        let modules = vec![
+            placed(1, ModuleKind::Wled, ModuleBody::Wled(wled_with(&[0.2]))),
+            placed(2, ModuleKind::Map, ModuleBody::Map(MapState::new())),
+            placed(3, ModuleKind::Blend, ModuleBody::Blend(BlendState::new())),
+        ];
+        // Map -> Blend's mix was fine while Map got a single number; now it gets an array.
+        let mut connections = vec![cable(2, 0, 3, 2), cable(1, 0, 2, 0)];
+        drop_mismatched(&modules, &mut connections);
+        assert_eq!(connections, [cable(1, 0, 2, 0)]);
+        assert!(PortType::Numbers.accepts(PortType::Number) && !PortType::Number.accepts(PortType::Numbers));
+    }
 }

@@ -6,7 +6,7 @@
       "kind": "output",
       "pos": [
         0.0,
-        95.0
+        260.0
       ],
       "minimized": false,
       "show_preview": true
@@ -15,12 +15,43 @@
       "id": 1,
       "kind": "wled",
       "pos": [
+        -260.0,
+        -110.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    },
+    {
+      "id": 2,
+      "kind": "map",
+      "pos": [
         0.0,
+        -110.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    },
+    {
+      "id": 3,
+      "kind": "select",
+      "pos": [
+        260.0,
         -110.0
       ],
       "minimized": false,
       "show_preview": false
     }
   ],
-  "connections": []
+  "connections": [
+    {
+      "from": 1,
+      "to": 2,
+      "to_input": 0
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "to_input": 0
+    }
+  ]
 }
