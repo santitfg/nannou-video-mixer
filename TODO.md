@@ -46,6 +46,13 @@ La vista simplificada ya existe: cada proyecto es independiente, aparece como pe
 - [ ] Guardar/abrir esta vista (hoy la sesión solo guarda el proyecto activo).
 - [ ] Botón o atajo para alternar entre vista simple y compleja.
 
+## Cámara: la misma cámara en varios módulos (bug)
+Varios módulos Camera apuntando al mismo dispositivo no funcionan bien. Cada `CameraState` tiene su propio `worker` (`CameraWorker::spawn`, `src/modules/sources/camera.rs`), así que cada módulo abre el dispositivo por su cuenta. En Windows (Media Foundation) la cámara suele ser de uso exclusivo: el segundo y el tercer `open_stream` fallan o se pelean por los frames, y esos módulos quedan sin señal o reintentando (`failures` / `retry_at`).
+- [ ] Compartir la captura por dispositivo: un solo worker por cámara (clave: `CameraIndex` o nombre) con contador de referencias, y que cada módulo Camera solo lea/suba el último frame de ese worker.
+- [ ] Liberar el worker cuando el último módulo que lo usa se borra, cambia de cámara o el proyecto se aparca.
+- [ ] Probar a mano: 3 módulos con la misma webcam, cambiar uno a otra cámara, desenchufar y volver a enchufar.
+- [ ] Cuando esté arreglado, volver a conectar las Cam 2 y Cam 3 de los proyectos de `proyectos/`. Hoy las tres cadenas salen de la Cam 1 y las Cam 2 y 3 están creadas pero sin conectar (ver `gen_proyectos.py`, opción `SHARED_CAM`).
+
 ## Map: modo Center (oculto)
 El botón **Center** del Map se sacó de la interfaz por críptico, pero la implementación sigue (`MapState::center`, se guarda en el archivo y escala cada lado del cero por separado).
 - [ ] Probarlo a mano (rango From con negativos y positivos, p. ej. -1..1 hacia 0..1) y decidir si vuelve con un nombre y una explicación más claros, o si se elimina.

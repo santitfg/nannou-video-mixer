@@ -81,6 +81,18 @@ The icon is drawn by `scripts/make-icon.py` (standard-library Python); edit it a
 
 Linux needs a Linux machine (`./scripts/build-linux.sh`). Windows builds natively from Git Bash after `setup-windows.ps1`, or cross-compiles from Linux with `sudo apt install mingw-w64`.
 
+The Windows `.exe` links the C runtime statically (`.cargo/config.toml`), so it runs on any Windows 10/11 x64 without the Visual C++ Redistributable. Release builds open no console window.
+
+### Windows installer
+
+On Windows, after `setup-windows.ps1`:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1
+```
+
+Builds the release `.exe` and packs `dist\Video-Mixer-<version>-x64-setup.exe` with [Inno Setup](https://jrsoftware.org/isinfo.php) (installed with winget on first use; `-SkipBuild` reuses the last build). The installer needs no admin rights: it installs to `%LOCALAPPDATA%\Programs\Video Mixer`, and the Start menu shortcut starts the program in `%APPDATA%\Video Mixer`, where shaders (seeded from the installer, your edits are kept on updates), settings, presets and the last session live. Uninstalling keeps that folder. The installer script is `scripts/windows-installer.iss`.
+
 ### Other platforms: GitHub Actions
 
 Cross-compiling a GUI app for another OS needs that OS's SDK, so the reliable way to get every platform from one machine is the included workflow (`.github/workflows/release.yml`): it builds Linux, Windows and macOS (Apple Silicon and Intel) on their own runners. Trigger it from the Actions tab or by pushing a `v*` tag, then download the artifacts.

@@ -1,3 +1,7 @@
+// Release builds on Windows open no console window next to the app (the debug
+// log is still shown inside the app, from Settings).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod debug_log;
 mod examples;
 mod gpu;

@@ -304,8 +304,87 @@ fn validated_cpu_flag(var: &str, value: String) -> String {
     value
 }
 
+/// First `dir/exe` that exists, for `dir` in a PATH-style list.
+fn find_in(exe: &str, dirs: &std::ffi::OsStr) -> Option<PathBuf> {
+    env::split_paths(dirs).map(|d| d.join(exe)).find(|p| p.is_file())
+}
+
+/// Puts `first` in front of the current value of the PATH-style variable `var`.
+fn prepend_paths(var: &str, first: impl IntoIterator<Item = PathBuf>) {
+    let old = env::var_os(var).unwrap_or_default();
+    let all: Vec<PathBuf> = first.into_iter().chain(env::split_paths(&old)).collect();
+    unsafe { env::set_var(var, env::join_paths(all).unwrap()) };
+}
+
+/// Native Windows MSVC builds (local patch, see the project's Cargo.toml).
+/// FFmpeg's configure is a POSIX shell script, so it needs MSYS2's sh and
+/// make, plus cl.exe and nasm. Find them where they are normally installed
+/// so `cargo build` works from any terminal (PowerShell, cmd, Git Bash), and
+/// put MSVC first on PATH so its link.exe wins over MSYS2's coreutils `link`.
+/// Returns whether nasm was found (without it FFmpeg builds without x86 asm).
+fn prepare_msvc_env() -> io::Result<bool> {
+    println!("cargo:rerun-if-env-changed=MSYS2_ROOT");
+    let target = env::var("TARGET").unwrap();
+    let path = || env::var_os("PATH").unwrap_or_default();
+
+    // cl.exe: outside a "Developer Prompt" load the Visual Studio environment.
+    if find_in("cl.exe", &path()).is_none() {
+        let cl = cc::windows_registry::find_tool(&target, "cl.exe").ok_or_else(|| {
+            io::Error::other(
+                "Could not find the MSVC compiler (cl.exe). Install Visual Studio (or its \
+                 Build Tools) with the \"Desktop development with C++\" workload.",
+            )
+        })?;
+        for (key, value) in cl.get_envs() {
+            let key = key.to_string_lossy().to_uppercase();
+            prepend_paths(&key, env::split_paths(value));
+        }
+        prepend_paths("PATH", cl.path().parent().map(Path::to_path_buf));
+    }
+    let cl_dir = find_in("cl.exe", &path())
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .ok_or_else(|| io::Error::other("cl.exe was found but is not usable from PATH"))?;
+
+    // MSYS2's usr\bin, which must have both sh.exe and make.exe (Git for
+    // Windows has sh but no make).
+    let msys_ok = |dir: &Path| dir.join("sh.exe").is_file() && dir.join("make.exe").is_file();
+    let msys_bin = env::var_os("MSYS2_ROOT")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([PathBuf::from(r"C:\msys64"), PathBuf::from(r"C:\tools\msys64")])
+        .map(|root| root.join("usr").join("bin"))
+        .chain(env::split_paths(&path()))
+        .find(|dir| msys_ok(dir))
+        .ok_or_else(|| {
+            io::Error::other(
+                "Could not find MSYS2 with make (FFmpeg's configure is a shell script). Install \
+                 it with scripts\\setup-windows.ps1, or `winget install MSYS2.MSYS2` and then \
+                 `C:\\msys64\\usr\\bin\\bash.exe -lc \"pacman -S --noconfirm make diffutils\"`. \
+                 Set MSYS2_ROOT if it is not in C:\\msys64.",
+            )
+        })?;
+
+    // nasm: on PATH, or where its installer (and winget) puts it.
+    let local = env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_default();
+    let nasm_dir = find_in("nasm.exe", &path())
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .or_else(|| {
+            [
+                PathBuf::from(r"C:\Program Files\NASM"),
+                local.join("bin").join("NASM"),
+                local.join("Programs").join("NASM"),
+            ]
+            .into_iter()
+            .find(|d| d.join("nasm.exe").is_file())
+        });
+
+    prepend_paths("PATH", [Some(cl_dir), Some(msys_bin), nasm_dir.clone()].into_iter().flatten());
+    Ok(nasm_dir.is_some())
+}
+
 fn build(sysroot: Option<&str>) -> io::Result<()> {
     let source_dir = source();
+    let has_nasm = if cfg!(target_env = "msvc") { prepare_msvc_env()? } else { true };
     if cfg!(target_os = "windows") {
         let path = env::var("PATH").unwrap_or_default();
         let mut paths = env::split_paths(&path).collect::<Vec<_>>();
@@ -326,6 +405,19 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     // Command's path is not relative to command's current_dir
     let configure_path = source_dir.join("configure");
     assert!(configure_path.exists());
+
+    // configure recognizes cl.exe by a banner starting with "Microsoft", and
+    // asks for English with VSLANG=1033. Without the English language pack a
+    // localized cl prints e.g. "Compilador ... de Microsoft (R)", so match the
+    // word anywhere in the line (local patch).
+    if cfg!(target_env = "msvc") {
+        let script = fs::read_to_string(&configure_path)?;
+        let patched = script.replace("grep -q ^Microsoft", "grep -q Microsoft")
+            .replace("grep ^Microsoft", "grep Microsoft");
+        if patched != script {
+            fs::write(&configure_path, patched)?;
+        }
+    }
     let mut configure = if cfg!(target_os = "windows") {
         if Command::new("sh")
             .arg("-c")
@@ -342,6 +434,13 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         configure.arg(configure_path);
         if cfg!(target_env = "msvc") {
             configure.arg("--toolchain=msvc");
+        }
+        if !has_nasm {
+            println!(
+                "cargo:warning=nasm not found: building FFmpeg without x86 assembly \
+                 (slower video decoding). Install it with `winget install NASM.NASM`."
+            );
+            configure.arg("--disable-x86asm");
         }
 
         configure
@@ -429,7 +528,8 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         if !mtune.is_empty() {
             parts.push(format!("-mtune={mtune}"));
         }
-        if !parts.is_empty() {
+        // cl.exe has no -march/-mtune (local patch).
+        if !parts.is_empty() && !cfg!(target_env = "msvc") {
             configure.arg(format!("--extra-cflags={}", parts.join(" ")));
         }
     }
@@ -1102,7 +1202,10 @@ fn main() {
             search().join("lib").to_string_lossy()
         );
         link_to_libraries(statik, &target_os);
-        if fs::metadata(search().join("lib").join("libavutil.a")).is_err() {
+        // MSVC builds name static libraries avutil.lib (local patch: checking
+        // only libavutil.a re-cloned and rebuilt FFmpeg on every build there).
+        let lib = search().join("lib");
+        if !lib.join("libavutil.a").is_file() && !lib.join("avutil.lib").is_file() {
             fs::create_dir_all(output()).expect("failed to create build directory");
             fetch().unwrap();
             build(sysroot.as_deref()).unwrap();

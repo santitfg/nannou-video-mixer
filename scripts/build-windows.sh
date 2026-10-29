@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Windows binary.
 #  - On Windows (Git Bash / MSYS2): a native MSVC build. Run setup-windows.ps1
-#    once first. FFmpeg's configure needs MSYS2's make on PATH.
+#    once first; FFmpeg's build script finds MSVC, MSYS2 and NASM by itself.
+#    (From PowerShell, `cargo build --release` works the same way.)
 #  - On Linux: cross-compiled with mingw-w64.
 #  - On macOS: not possible from here; use the GitHub Actions workflow.
 set -euo pipefail

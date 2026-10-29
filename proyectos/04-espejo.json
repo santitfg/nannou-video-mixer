@@ -1,0 +1,363 @@
+{
+  "name": "Espejo",
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        520.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    },
+    {
+      "id": 1,
+      "kind": "camera",
+      "pos": [
+        -900.0,
+        330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "USB2.0 HD UVC WebCam"
+    },
+    {
+      "id": 2,
+      "kind": "effect",
+      "pos": [
+        -620.0,
+        330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "mirror.glsl",
+      "shader_category": "Distortion",
+      "shader_params": {
+        "_Mode": {
+          "value": 0.0,
+          "min": 0.0,
+          "max": 4.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 3,
+      "kind": "effect",
+      "pos": [
+        -340.0,
+        330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "chroma_shift.glsl",
+      "shader_category": "Glitch",
+      "shader_params": {
+        "_Amount": {
+          "value": 0.005,
+          "min": 0.0,
+          "max": 0.1,
+          "clamp": true
+        },
+        "_Angle": {
+          "value": 0.8,
+          "min": 0.0,
+          "max": 6.2832,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 4,
+      "kind": "camera",
+      "pos": [
+        -900.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "USB2.0 HD UVC WebCam"
+    },
+    {
+      "id": 5,
+      "kind": "feedback",
+      "pos": [
+        -620.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "feedback.glsl",
+      "shader_category": "Feedback",
+      "shader_params": {
+        "_Mode": {
+          "value": 3.0,
+          "min": 0.0,
+          "max": 5.0,
+          "clamp": true
+        },
+        "_Feedback": {
+          "value": 0.6,
+          "min": 0.0,
+          "max": 0.99,
+          "clamp": true
+        },
+        "_Zoom": {
+          "value": 1.0,
+          "min": 0.9,
+          "max": 1.1,
+          "clamp": true
+        },
+        "_Rotate": {
+          "value": 0.0,
+          "min": -0.1,
+          "max": 0.1,
+          "clamp": true
+        },
+        "_Distort": {
+          "value": 0.2,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 6,
+      "kind": "camera",
+      "pos": [
+        -900.0,
+        -330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "USB2.0 HD UVC WebCam"
+    },
+    {
+      "id": 7,
+      "kind": "effect",
+      "pos": [
+        -620.0,
+        -330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "threshold.glsl",
+      "shader_category": "Threshold",
+      "shader_params": {
+        "_Mode": {
+          "value": 2.0,
+          "min": 0.0,
+          "max": 2.0,
+          "clamp": true
+        },
+        "_Level": {
+          "value": 0.5,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Bands": {
+          "value": 4.0,
+          "min": 1.0,
+          "max": 16.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 8,
+      "kind": "blend",
+      "pos": [
+        -340.0,
+        -330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "mix": 0.4,
+      "param": {
+        "value": 0.4,
+        "min": 0.0,
+        "max": 1.0,
+        "clamp": true
+      },
+      "blend_mode": "overlay"
+    },
+    {
+      "id": 9,
+      "kind": "shadermix",
+      "pos": [
+        220.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "mixer.glsl",
+      "shader_category": "Mixing",
+      "shader_params": {
+        "_Mode": {
+          "value": 2.0,
+          "min": 0.0,
+          "max": 4.0,
+          "clamp": true
+        },
+        "_Level1": {
+          "value": 0.7,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Level2": {
+          "value": 0.7,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Level3": {
+          "value": 0.7,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 10,
+      "kind": "wled",
+      "pos": [
+        -820.0,
+        -720.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    },
+    {
+      "id": 11,
+      "kind": "map",
+      "pos": [
+        -560.0,
+        -720.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    },
+    {
+      "id": 12,
+      "kind": "select",
+      "pos": [
+        -300.0,
+        -720.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    }
+  ],
+  "connections": [
+    {
+      "from": 1,
+      "to": 2,
+      "to_input": 0
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "to_input": 0
+    },
+    {
+      "from": 1,
+      "to": 5,
+      "to_input": 0
+    },
+    {
+      "from": 1,
+      "to": 7,
+      "to_input": 0
+    },
+    {
+      "from": 1,
+      "to": 8,
+      "to_input": 0
+    },
+    {
+      "from": 7,
+      "to": 8,
+      "to_input": 1
+    },
+    {
+      "from": 3,
+      "to": 9,
+      "to_input": 0
+    },
+    {
+      "from": 5,
+      "to": 9,
+      "to_input": 1
+    },
+    {
+      "from": 8,
+      "to": 9,
+      "to_input": 2
+    },
+    {
+      "from": 9,
+      "to": 0,
+      "to_input": 0
+    },
+    {
+      "from": 10,
+      "to": 11,
+      "to_input": 0
+    },
+    {
+      "from": 11,
+      "to": 12,
+      "to_input": 0
+    }
+  ],
+  "groups": [
+    {
+      "title": "Cam 1",
+      "members": [
+        1,
+        2,
+        3
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "Cam 2",
+      "members": [
+        4,
+        5
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "Cam 3",
+      "members": [
+        6,
+        7,
+        8
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "Mixer",
+      "members": [
+        9
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "WLED (control)",
+      "members": [
+        10,
+        11,
+        12
+      ],
+      "collapsed": false
+    }
+  ]
+}

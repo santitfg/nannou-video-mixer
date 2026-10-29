@@ -1,0 +1,398 @@
+{
+  "name": "Pulso",
+  "output_id": 0,
+  "modules": [
+    {
+      "id": 0,
+      "kind": "output",
+      "pos": [
+        520.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true
+    },
+    {
+      "id": 1,
+      "kind": "camera",
+      "pos": [
+        -900.0,
+        330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "USB2.0 HD UVC WebCam"
+    },
+    {
+      "id": 2,
+      "kind": "feedback",
+      "pos": [
+        -620.0,
+        330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "feedback.glsl",
+      "shader_category": "Feedback",
+      "shader_params": {
+        "_Mode": {
+          "value": 1.0,
+          "min": 0.0,
+          "max": 5.0,
+          "clamp": true
+        },
+        "_Feedback": {
+          "value": 0.5,
+          "min": 0.0,
+          "max": 0.99,
+          "clamp": true
+        },
+        "_Zoom": {
+          "value": 1.01,
+          "min": 0.9,
+          "max": 1.1,
+          "clamp": true
+        },
+        "_Rotate": {
+          "value": 0.0,
+          "min": -0.1,
+          "max": 0.1,
+          "clamp": true
+        },
+        "_Distort": {
+          "value": 0.0,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 3,
+      "kind": "effect",
+      "pos": [
+        -340.0,
+        330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "color_correct.glsl",
+      "shader_category": "Color",
+      "shader_params": {
+        "_Contrast": {
+          "value": 1.15,
+          "min": 0.0,
+          "max": 3.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 4,
+      "kind": "camera",
+      "pos": [
+        -900.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "USB2.0 HD UVC WebCam"
+    },
+    {
+      "id": 5,
+      "kind": "effect",
+      "pos": [
+        -620.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "edge_detect.glsl",
+      "shader_category": "Stylize",
+      "shader_params": {
+        "_Mode": {
+          "value": 0.0,
+          "min": 0.0,
+          "max": 2.0,
+          "clamp": true
+        },
+        "_Strength": {
+          "value": 2.0,
+          "min": 0.0,
+          "max": 5.0,
+          "clamp": true
+        },
+        "_Mix": {
+          "value": 1.0,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 6,
+      "kind": "blend",
+      "pos": [
+        -340.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "mix": 0.5,
+      "param": {
+        "value": 0.5,
+        "min": 0.0,
+        "max": 1.0,
+        "clamp": true
+      },
+      "blend_mode": "add"
+    },
+    {
+      "id": 7,
+      "kind": "camera",
+      "pos": [
+        -900.0,
+        -330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "camera_name": "USB2.0 HD UVC WebCam"
+    },
+    {
+      "id": 8,
+      "kind": "effect",
+      "pos": [
+        -620.0,
+        -330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "threshold.glsl",
+      "shader_category": "Threshold",
+      "shader_params": {
+        "_Mode": {
+          "value": 1.0,
+          "min": 0.0,
+          "max": 2.0,
+          "clamp": true
+        },
+        "_Level": {
+          "value": 0.4,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Softness": {
+          "value": 0.05,
+          "min": 0.0,
+          "max": 0.5,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 9,
+      "kind": "blend",
+      "pos": [
+        -340.0,
+        -330.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "mix": 0.5,
+      "param": {
+        "value": 0.5,
+        "min": 0.0,
+        "max": 1.0,
+        "clamp": true
+      },
+      "blend_mode": "mix"
+    },
+    {
+      "id": 10,
+      "kind": "shadermix",
+      "pos": [
+        220.0,
+        0.0
+      ],
+      "minimized": false,
+      "show_preview": true,
+      "shader_file": "mixer.glsl",
+      "shader_category": "Mixing",
+      "shader_params": {
+        "_Mode": {
+          "value": 1.0,
+          "min": 0.0,
+          "max": 4.0,
+          "clamp": true
+        },
+        "_Level1": {
+          "value": 0.45,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Level2": {
+          "value": 0.45,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        },
+        "_Level3": {
+          "value": 0.45,
+          "min": 0.0,
+          "max": 1.0,
+          "clamp": true
+        }
+      }
+    },
+    {
+      "id": 11,
+      "kind": "wled",
+      "pos": [
+        -820.0,
+        -720.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    },
+    {
+      "id": 12,
+      "kind": "map",
+      "pos": [
+        -560.0,
+        -720.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    },
+    {
+      "id": 13,
+      "kind": "select",
+      "pos": [
+        -300.0,
+        -720.0
+      ],
+      "minimized": false,
+      "show_preview": false
+    }
+  ],
+  "connections": [
+    {
+      "from": 1,
+      "to": 2,
+      "to_input": 0
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "to_input": 0
+    },
+    {
+      "from": 1,
+      "to": 5,
+      "to_input": 0
+    },
+    {
+      "from": 1,
+      "to": 6,
+      "to_input": 0
+    },
+    {
+      "from": 5,
+      "to": 6,
+      "to_input": 1
+    },
+    {
+      "from": 1,
+      "to": 8,
+      "to_input": 0
+    },
+    {
+      "from": 1,
+      "to": 9,
+      "to_input": 0
+    },
+    {
+      "from": 8,
+      "to": 9,
+      "to_input": 1
+    },
+    {
+      "from": 3,
+      "to": 10,
+      "to_input": 0
+    },
+    {
+      "from": 6,
+      "to": 10,
+      "to_input": 1
+    },
+    {
+      "from": 9,
+      "to": 10,
+      "to_input": 2
+    },
+    {
+      "from": 10,
+      "to": 0,
+      "to_input": 0
+    },
+    {
+      "from": 11,
+      "to": 12,
+      "to_input": 0
+    },
+    {
+      "from": 12,
+      "to": 13,
+      "to_input": 0
+    }
+  ],
+  "groups": [
+    {
+      "title": "Cam 1",
+      "members": [
+        1,
+        2,
+        3
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "Cam 2",
+      "members": [
+        4,
+        5,
+        6
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "Cam 3",
+      "members": [
+        7,
+        8,
+        9
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "Mixer",
+      "members": [
+        10
+      ],
+      "collapsed": false
+    },
+    {
+      "title": "WLED (control)",
+      "members": [
+        11,
+        12,
+        13
+      ],
+      "collapsed": false
+    }
+  ]
+}
